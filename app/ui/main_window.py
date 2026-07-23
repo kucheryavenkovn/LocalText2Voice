@@ -172,6 +172,7 @@ from mutagen import File as MutagenFile
 from .audio_mix_preview_panel import AudioMixPreviewContext, AudioMixPreviewPanel
 from .icons import ICON_LIGHT, ui_icon
 from .markup_highlighter import LTVMarkupHighlighter
+from .video_dubbing_page import VideoDubbingPage
 from .voice_manager_dialog import VoiceManagerDialog
 from .widgets import FilePicker, LogView, PathPicker
 
@@ -889,6 +890,14 @@ class MainWindow(QMainWindow):
         )
         self.page_stack.addWidget(self.audio_mix_preview_panel)
         self.page_stack.addWidget(self._build_voices_page())
+        self.video_dubbing_page = VideoDubbingPage(
+            self.tr,
+            ffmpeg_path=str(self.settings.get("ffmpeg_path", "ffmpeg/ffmpeg.exe")),
+            default_output_dir=str(
+                resolve_app_path(self.settings.get("output_dir", "output"))
+            ),
+        )
+        self.page_stack.addWidget(self.video_dubbing_page)
         content_layout.addWidget(self.page_stack, 1)
 
         body_layout.addWidget(content_widget, 1)
@@ -987,6 +996,7 @@ class MainWindow(QMainWindow):
             ("nav_music", "Music", self._show_music_page),
             ("nav_review", "Review", self._show_review_page),
             ("audio_mix_preview", "Audio Mix", self._show_mix_preview_page),
+            ("nav_video_dubbing", "Video Dubbing", self._show_video_dubbing_page),
         ):
             action = QAction(self.tr(label_key, default), self)
             action.triggered.connect(callback)
@@ -1092,6 +1102,12 @@ class MainWindow(QMainWindow):
                 "waveform",
                 self.tr("audio_mix_preview", "Audio Mix"),
                 self._show_mix_preview_page,
+            ),
+            (
+                "video_dubbing",
+                "waveform",
+                self.tr("nav_video_dubbing", "Video Dubbing"),
+                self._show_video_dubbing_page,
             ),
         )
         for key, icon_name, text, callback in nav_items:
@@ -2626,6 +2642,42 @@ class MainWindow(QMainWindow):
             "voice",
         )
         self._refresh_voices_page()
+
+    def _show_video_dubbing_page(self) -> None:
+        ffmpeg_path = str(self.settings.get("ffmpeg_path", "ffmpeg/ffmpeg.exe"))
+        output_dir = str(resolve_app_path(self.settings.get("output_dir", "output")))
+        self.video_dubbing_page.set_ffmpeg_path(ffmpeg_path)
+        self.video_dubbing_page.project_dir_picker.set_path(output_dir)
+        # Inject the currently selected engine + voice config when available so
+        # the dubbing page reuses the existing TTS setup instead of a parallel one.
+        try:
+            voice_config = self._current_voice_config()
+        except Exception:
+            voice_config = None
+        if voice_config is not None:
+            try:
+                engine_id = str(voice_config.get("engine", "piper"))
+                piper_path = resolve_app_path(
+                    self.settings.get("piper_path", "engines/piper/piper.exe")
+                )
+                from app.tts.engine_registry import create_tts_engine
+
+                engine = create_tts_engine(engine_id, piper_path)
+                self.video_dubbing_page.set_engine_context(
+                    engine, voice_config, ffmpeg_path
+                )
+            except Exception as exc:
+                self.log_view.append_event(f"Video dubbing engine init skipped: {exc}")
+        self._show_page(
+            6,
+            "video_dubbing",
+            self.tr("nav_video_dubbing", "Video Dubbing"),
+            self.tr(
+                "video_dubbing_subtitle",
+                "Dub a video from an SRT script with timed TTS narration.",
+            ),
+            "waveform",
+        )
 
     def _show_review_page(self) -> None:
         self._show_page(
