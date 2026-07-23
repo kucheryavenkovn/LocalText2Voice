@@ -4,7 +4,6 @@ import math
 import threading
 import wave
 from array import array
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -153,7 +152,6 @@ class AudioMixer:
         output_path: Path,
     ) -> Path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        layout = "stereo" if self.channels == 2 else "mono"
         arguments = [
             "-y",
             "-hide_banner",

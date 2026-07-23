@@ -41,9 +41,9 @@ class VoiceCatalogService:
             if engine_id == "qwen":
                 return self._list_qwen()
             if engine_id == "chatterbox":
-                return self._list_simple(["reference_audio_path"], engine_id)
+                return self._list_reference_voices("chatterbox")
             if engine_id == "omnivoice":
-                return self._list_simple(["reference_audio_path"], engine_id)
+                return self._list_reference_voices("omnivoice")
             if engine_id in {"openai", "elevenlabs", "gemini", "azure"}:
                 return []
             if engine_id.startswith("custom:"):
@@ -77,7 +77,20 @@ class VoiceCatalogService:
         elif engine_id == "qwen":
             config["speaker"] = voice_id
         elif engine_id in {"chatterbox", "omnivoice"}:
-            config.setdefault("reference_audio_path", voice_id)
+            ref = self._resolve_reference_voice(engine_id, voice_id)
+            if ref is not None:
+                manager, voice = ref
+                try:
+                    audio_path = manager.ensure_voice_audio(voice)
+                except Exception:
+                    audio_path = None
+                if audio_path:
+                    config["reference_audio_path"] = str(audio_path)
+                    if getattr(voice, "ref_text", ""):
+                        config["reference_text"] = voice.ref_text
+                config.setdefault("reference_audio_path", voice_id)
+            else:
+                config.setdefault("reference_audio_path", voice_id)
         elif engine_id in {"openai", "gemini", "azure"}:
             config["voice"] = voice_id
         elif engine_id == "elevenlabs":
@@ -165,6 +178,43 @@ class VoiceCatalogService:
                     voice_id=voice.voice_id,
                     display_name=getattr(voice, "display_name", voice.voice_id),
                     language=getattr(voice, "language", None),
+                )
+            )
+        result.sort(key=lambda v: v.display_name.lower())
+        return result
+
+    def _resolve_reference_voice(self, engine_id: str, voice_id: str):
+        try:
+            from app.tts.voice_gallery_manager import VoiceGalleryManager
+
+            manager = VoiceGalleryManager()
+            manager.ensure_seed_loaded()
+            for voice in manager.list_voices(engine_id):
+                if voice.name == voice_id and manager.preview_source(voice):
+                    return manager, voice
+        except Exception:  # pragma: no cover
+            return None
+        return None
+
+    def _list_reference_voices(self, engine_id: str) -> list[VoiceDescriptor]:
+        try:
+            from app.tts.voice_gallery_manager import VoiceGalleryManager
+
+            manager = VoiceGalleryManager()
+            manager.ensure_seed_loaded()
+            voices = [v for v in manager.list_voices(engine_id) if manager.preview_source(v)]
+        except Exception as exc:  # pragma: no cover - depends on gallery sync
+            _logger.warning("%s gallery voice list failed: %s", engine_id, exc)
+            return []
+        result: list[VoiceDescriptor] = []
+        for voice in voices:
+            result.append(
+                VoiceDescriptor(
+                    voice_id=voice.name,
+                    display_name=f"{voice.name}" + (f" — {voice.language}" if voice.language else ""),
+                    language=voice.language or None,
+                    installed=True,
+                    metadata={"engine": engine_id, "has_ref_text": bool(voice.ref_text)},
                 )
             )
         result.sort(key=lambda v: v.display_name.lower())

@@ -35,7 +35,6 @@ from PySide6.QtWidgets import (
 
 from app.core.video_dubbing.models import (
     Alignment,
-    BLOCKING_STATUSES,
     CueStatus,
     DubbingCue,
     DubbingProject,
@@ -46,7 +45,6 @@ from app.core.video_dubbing.models import (
     OutputContainer,
     PreviewSettings,
     SyncMode,
-    VideoProbeInfo,
 )
 from app.core.video_dubbing.project_store import DUBBING_MANIFEST_NAME
 from app.core.video_dubbing.service import (
@@ -197,7 +195,7 @@ class VideoDubbingPage(QWidget):
         self.compress_pauses_check = QCheckBox(
             self.tr("video_dubbing_compress_pauses", "Compress internal pauses")
         )
-        self.compress_pauses_check.setChecked(True)
+        self.compress_pauses_check.setChecked(False)
 
         self.sync_combo = QComboBox()
         self.sync_combo.addItem(self.tr("video_dubbing_strict", "Strict"), SyncMode.STRICT.value)
@@ -703,9 +701,12 @@ class VideoDubbingPage(QWidget):
         if self._project is None:
             return
         self._apply_ui_to_project()
-        service = self._ensure_service()
+        self._ensure_service()
         if mode == "missing":
-            op = lambda svc: svc.generate_all(self._project, force=False)
+
+            def op(svc):
+                return svc.generate_all(self._project, force=False)
+
         elif mode == "selected":
             sequences = [
                 int(self.cue_table.item(row, 0).text())
@@ -714,10 +715,16 @@ class VideoDubbingPage(QWidget):
             if not sequences:
                 self._show_info(self.tr("video_dubbing_select_cue", "Select at least one cue."))
                 return
-            op = lambda svc: svc.generate_selected(self._project, sequences, force=True)
+
+            def op(svc):  # noqa: F811
+                return svc.generate_selected(self._project, sequences, force=True)
         else:
             return
-        self._start_worker(op, lambda result: self._refresh_ui_from_project())
+
+        def on_done(result):
+            self._refresh_ui_from_project()
+
+        self._start_worker(op, on_done)
 
     def _confirm_force_all(self) -> None:
         if self._project is None:
@@ -733,15 +740,27 @@ class VideoDubbingPage(QWidget):
         if choice != QMessageBox.StandardButton.Yes:
             return
         self._apply_ui_to_project()
-        op = lambda svc: svc.generate_all(self._project, force=True)
-        self._start_worker(op, lambda result: self._refresh_ui_from_project())
+
+        def op(svc):
+            return svc.generate_all(self._project, force=True)
+
+        def on_done(result):
+            self._refresh_ui_from_project()
+
+        self._start_worker(op, on_done)
 
     def _refit_existing(self) -> None:
         if self._project is None:
             return
         self._apply_ui_to_project()
-        op = lambda svc: svc.re_fit_existing(self._project)
-        self._start_worker(op, lambda result: self._refresh_ui_from_project())
+
+        def op(svc):
+            return svc.re_fit_existing(self._project)
+
+        def on_done(result):
+            self._refresh_ui_from_project()
+
+        self._start_worker(op, on_done)
 
     def _render_narration(self) -> None:
         if self._project is None:
@@ -826,6 +845,7 @@ class VideoDubbingPage(QWidget):
         if self._worker_thread is not None:
             return
         service = self._ensure_service()
+        service.reset_cancel()
         thread = QThread(self)
         worker = VideoDubbingWorker(service, operation)
         worker.moveToThread(thread)

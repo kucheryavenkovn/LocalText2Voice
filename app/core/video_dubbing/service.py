@@ -8,25 +8,23 @@ from typing import Any, Callable
 
 from app.tts.base import BaseTTSEngine
 from app.utils import ffprobe_utils
-from app.utils.ffmpeg_utils import FFmpegError
 
 from .audio_mixer import AudioMixer
 from .cue_generator import CueGenerator, CueGenerationError
 from .duration_fitter import DurationFitter
 from .models import (
-    Alignment,
+    BLOCKING_STATUSES,
+    READY_STATUSES,
     CueStatus,
     DubbingCue,
     DubbingProject,
     DubbingProjectSettings,
-    SyncMode,
     VideoProbeInfo,
 )
 from .preview_renderer import PreviewRenderer
 from .project_store import DubbingProjectStore
 from .reports import build_report, write_reports
 from .srt_parser import (
-    SrtParseError,
     SrtWarning,
     cues_from_parsed,
     parse_srt,
@@ -158,6 +156,10 @@ class VideoDubbingService:
                 except Exception:  # pragma: no cover - defensive
                     pass
 
+    def reset_cancel(self) -> None:
+        """Allow a new operation after the previous one was cancelled."""
+        self._cancel_requested.clear()
+
     def _check_cancelled(self) -> None:
         if self._cancel_requested.is_set():
             raise VideoDubbingServiceError("Operation cancelled.")
@@ -195,12 +197,19 @@ class VideoDubbingService:
         return project
 
     def backfill_legacy_fingerprints(self, project: DubbingProject) -> None:
-        """Trust already-synthesized legacy cues so they are never re-synthesized."""
+        """Flag legacy cues whose raw audio exists but whose provenance cannot
+        be verified. Does NOT invent a fingerprint — confirmed fingerprints are
+        recorded only after a real synthesis. The flag drives the UI warning
+        and forces TTS when voice/text later change."""
         changed = False
         for cue in project.cues:
             if not cue.generation_fingerprint and self._raw_intact(cue):
-                cue.generation_fingerprint = _fingerprint(cue, project.settings)
-                changed = True
+                if not cue.legacy_audio_unverified:
+                    cue.legacy_audio_unverified = True
+                    changed = True
+                if not cue.legacy_observed_fingerprint:
+                    cue.legacy_observed_fingerprint = _fingerprint(cue, project.settings)
+                    changed = True
         if changed:
             self.store.save_project(project)
 
@@ -327,54 +336,97 @@ class VideoDubbingService:
         project: DubbingProject,
         force: bool = False,
     ) -> dict[str, Any]:
-        """Classify cues into ready/missing/failed/will_generate/will_reuse.
+        """Classify every enabled cue into exact reuse categories.
 
-        ``will_generate`` = needs TTS re-synthesis (raw missing or inputs
-        changed). ``will_reuse`` = raw intact, only fitting must be re-run.
-        A ready cue is never re-synthesized.
+        Primary action categories (mutually exclusive for enabled cues):
+          ready_without_changes  — raw+fitted intact, provenance verified
+          needs_refit_from_raw   — raw intact but fitted missing/inconsistent;
+                                   re-fit from the existing raw WAV (no TTS)
+          needs_tts_generation   — raw missing/corrupt, or text/voice changed,
+                                   or legacy audio whose voice/text changed
+
+        ``missing_raw``, ``missing_fitted``, ``legacy_audio_unverified`` and
+        ``failed`` are overlapping diagnostics. ``disabled`` cues have no
+        primary action.
+
+        ``needs_tts_generation`` is only non-zero when a raw WAV is actually
+        missing/unreadable or the cue's text/voice genuinely changed.
         """
-        will_generate: list[int] = []
-        will_reuse: list[int] = []
-        stale: list[int] = []
-        missing: list[int] = []
+        ready_without_changes: list[int] = []
+        needs_refit_from_raw: list[int] = []
+        needs_tts_generation: list[int] = []
+        missing_raw: list[int] = []
+        missing_fitted: list[int] = []
+        legacy_audio_unverified: list[int] = []
         failed: list[int] = []
-        ready: list[int] = []
+        disabled: list[int] = []
+
         for cue in project.cues:
             if not cue.enabled:
+                disabled.append(cue.sequence)
                 continue
-            current_fp = _fingerprint(cue, project.settings)
-            raw_intact = self._raw_intact(cue)
-            # One-time migration: legacy cues (no fingerprint) with intact raw
-            # are trusted on first open so a full project is never re-synthesized
-            # just because it predates fingerprinting.
-            if not cue.generation_fingerprint and raw_intact:
-                cue.generation_fingerprint = current_fp
-            same_inputs = bool(cue.generation_fingerprint) and (
-                cue.generation_fingerprint == current_fp
-            )
             if cue.status == CueStatus.FAILED.value:
                 failed.append(cue.sequence)
-            if force:
-                will_generate.append(cue.sequence)
+
+            current_fp = _fingerprint(cue, project.settings)
+            raw_intact = self._raw_intact(cue)
+            fitted_intact = (
+                cue.fitted_audio_path is not None
+                and Path(cue.fitted_audio_path).is_file()
+                and cue.fitted_duration_ms is not None
+                and cue.fitted_duration_ms > 0
+            )
+            if not raw_intact:
+                missing_raw.append(cue.sequence)
+                needs_tts_generation.append(cue.sequence)
                 continue
-            needs_tts = (not raw_intact) or (not same_inputs)
-            if needs_tts:
-                will_generate.append(cue.sequence)
-                if not raw_intact:
-                    missing.append(cue.sequence)
-            elif self._cue_is_complete(cue):
-                ready.append(cue.sequence)
-            else:
-                # raw intact but fitted missing/inconsistent -> re-fit only.
-                will_reuse.append(cue.sequence)
-                stale.append(cue.sequence)
+            if not fitted_intact:
+                missing_fitted.append(cue.sequence)
+
+            provenance_verified = bool(cue.generation_fingerprint) and (
+                cue.generation_fingerprint == current_fp
+            )
+
+            if force:
+                needs_tts_generation.append(cue.sequence)
+                continue
+
+            if provenance_verified:
+                # Confirmed inputs match the existing raw audio.
+                if fitted_intact and cue.status in READY_STATUSES:
+                    ready_without_changes.append(cue.sequence)
+                else:
+                    needs_refit_from_raw.append(cue.sequence)
+                continue
+
+            if not cue.generation_fingerprint:
+                # The migration snapshot is not provenance: it only lets us
+                # detect changes made after the legacy audio was first seen.
+                if cue.legacy_observed_fingerprint == current_fp:
+                    legacy_audio_unverified.append(cue.sequence)
+                    needs_refit_from_raw.append(cue.sequence)
+                else:
+                    needs_tts_generation.append(cue.sequence)
+                continue
+
+            # Fingerprint exists but differs -> text/voice changed -> TTS.
+            needs_tts_generation.append(cue.sequence)
+
         return {
-            "ready": ready,
-            "stale": stale,
-            "missing": missing,
+            "ready_without_changes": ready_without_changes,
+            "needs_refit_from_raw": needs_refit_from_raw,
+            "needs_tts_generation": needs_tts_generation,
+            "missing_raw": missing_raw,
+            "missing_fitted": missing_fitted,
+            "legacy_audio_unverified": legacy_audio_unverified,
             "failed": failed,
-            "will_generate": will_generate,
-            "will_reuse": will_reuse,
+            "disabled": disabled,
+            # Backward-compatible aliases.
+            "ready": ready_without_changes,
+            "will_reuse": needs_refit_from_raw,
+            "will_generate": needs_tts_generation,
+            "stale": needs_refit_from_raw,
+            "missing": missing_raw,
         }
 
     def generate_cue(
@@ -422,13 +474,15 @@ class VideoDubbingService:
         if force:
             targets = [c for c in project.cues if c.enabled]
         else:
-            need = set(plan["will_generate"]) | set(plan["will_reuse"])
+            need = set(plan["needs_tts_generation"]) | set(plan["needs_refit_from_raw"])
             targets = [c for c in project.cues if c.sequence in need]
         self._log(
-            f"Ready: {len(plan['ready'])} | Stale: {len(plan['stale'])} | "
-            f"Missing: {len(plan['missing'])} | Failed: {len(plan['failed'])} | "
-            f"Will generate: {len(plan['will_generate'])} | "
-            f"Will reuse: {len(plan['will_reuse'])}"
+            f"Ready: {len(plan['ready_without_changes'])} | "
+            f"Refit-from-raw: {len(plan['needs_refit_from_raw'])} | "
+            f"TTS: {len(plan['needs_tts_generation'])} | "
+            f"Legacy unverified: {len(plan['legacy_audio_unverified'])} | "
+            f"Missing raw: {len(plan['missing_raw'])} | "
+            f"Failed: {len(plan['failed'])}"
         )
         self._begin_operation(
             "generate_all", cues=len(targets), total=len(project.cues), force=force
@@ -474,6 +528,7 @@ class VideoDubbingService:
         project: DubbingProject,
         cues: list[DubbingCue],
         force: bool = False,
+        stop_on_failure: bool = True,
     ) -> list[DubbingCue]:
         voice_config = self._resolve_voice_config(project)
         fitter = DurationFitter(project.settings, video_duration_ms=project.duration_ms)
@@ -481,6 +536,7 @@ class VideoDubbingService:
         self._active_cue_generator = generator
         cues_sorted = sorted(project.cues, key=lambda c: c.start_ms)
         total = len(cues)
+        processed: list[DubbingCue] = []
         try:
             for index, cue in enumerate(cues, start=1):
                 self._check_cancelled()
@@ -499,6 +555,7 @@ class VideoDubbingService:
                         cue.sequence, cue.status,
                         cue.raw_duration_ms or 0, cue.fitted_duration_ms or 0, index,
                     )
+                    processed.append(cue)
                 except CueGenerationError as exc:
                     cue.status = CueStatus.FAILED.value
                     cue.error_message = str(exc)
@@ -507,12 +564,20 @@ class VideoDubbingService:
                         cue.sequence, cue.status, 0, 0, index
                     )
                     self.log_callback(f"Cue #{cue.sequence} failed: {exc}")
+                    if stop_on_failure:
+                        # Stop the batch so resume picks up at this cue and the
+                        # remaining cues are processed on the next run.
+                        self.log_callback(
+                            f"Generation stopped at cue #{cue.sequence} (resume will "
+                            f"continue from here, {total - index} cue(s) pending)."
+                        )
+                        break
         finally:
             self._active_cue_generator = None
             self.progress_callback("tts", total, total, "Generation completed")
         invalidate_for_narration_change(project.stale)
         self.store.write_manifest_atomic(project)
-        return cues
+        return processed
 
     def _synthesize_and_fit(
         self,
@@ -525,13 +590,27 @@ class VideoDubbingService:
         cues_sorted: list[DubbingCue] | None = None,
     ) -> None:
         current_fp = _fingerprint(cue, project.settings)
-        same_inputs = bool(cue.generation_fingerprint) and cue.generation_fingerprint == current_fp
-        needs_tts = force or not same_inputs or not (
-            cue.raw_audio_path and Path(cue.raw_audio_path).is_file() and cue.raw_duration_ms
+        raw_intact = self._raw_intact(cue)
+        provenance_verified = bool(cue.generation_fingerprint) and (
+            cue.generation_fingerprint == current_fp
         )
+        if force:
+            needs_tts = True
+        elif not raw_intact:
+            needs_tts = True
+        elif provenance_verified:
+            needs_tts = False  # confirmed reuse
+        elif cue.legacy_audio_unverified or not cue.generation_fingerprint:
+            needs_tts = cue.legacy_observed_fingerprint != current_fp
+        else:
+            # Fingerprint exists but differs -> text/voice changed -> TTS.
+            needs_tts = True
+
         if needs_tts:
             generator.generate_raw(cue, voice_config)
             cue.generation_fingerprint = current_fp
+            cue.legacy_audio_unverified = False
+            cue.legacy_observed_fingerprint = ""
         if fitter is None:
             fitter = DurationFitter(project.settings, video_duration_ms=project.duration_ms)
         if cues_sorted is None:
@@ -871,7 +950,6 @@ class VideoDubbingService:
         self.store.save_project(project)
 
     def can_export(self, project: DubbingProject) -> tuple[bool, list[str]]:
-        from .models import BLOCKING_STATUSES
 
         blockers: list[str] = []
         for cue in project.cues:

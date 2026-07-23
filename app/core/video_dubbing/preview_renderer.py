@@ -11,7 +11,7 @@ from app.utils.ffmpeg_utils import (
     find_ffmpeg,
 )
 
-from .models import Alignment, DubbingCue, DubbingProject, OriginalAudioMode
+from .models import DubbingCue, DubbingProject, OriginalAudioMode
 from .duration_fitter import DurationFitter
 
 

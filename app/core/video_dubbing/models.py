@@ -117,6 +117,16 @@ class DubbingCue:
     # matches the current inputs and the WAV is intact, the cue is reused
     # instead of being re-synthesized.
     generation_fingerprint: str = ""
+    # True when the raw audio exists but its provenance (engine/voice/text used
+    # at creation time) could not be verified — e.g. cues generated before
+    # fingerprinting. Such cues may be re-fit from the existing raw WAV, but a
+    # change of voice or text MUST trigger TTS, and a confirmed fingerprint is
+    # only recorded after a real synthesis.
+    legacy_audio_unverified: bool = False
+    # Snapshot of the inputs observed when unverified legacy audio was first
+    # migrated. It detects later edits without claiming those inputs produced
+    # the raw WAV.
+    legacy_observed_fingerprint: str = ""
     # Per-cue override of the hard speed limit (0 = use project default).
     hard_speed_override: float = 0.0
     # Per-cue "force fit even beyond hard limit" flag.
@@ -304,7 +314,7 @@ class DubbingProjectSettings:
     hard_speed_limit: float = 2.50
     exact_timing: bool = True
     guard_gap_ms: int = 20
-    compress_internal_pauses: bool = True
+    compress_internal_pauses: bool = False
     internal_pause_keep_ms: int = 90
     sync_mode: SyncMode = SyncMode.STRICT
     ffmpeg_path: str = ""
@@ -361,7 +371,7 @@ class DubbingProjectSettings:
             hard_speed_limit=hard,
             exact_timing=bool(data.get("exact_timing", True)),
             guard_gap_ms=int(data.get("guard_gap_ms", 20)),
-            compress_internal_pauses=bool(data.get("compress_internal_pauses", True)),
+            compress_internal_pauses=bool(data.get("compress_internal_pauses", False)),
             internal_pause_keep_ms=int(data.get("internal_pause_keep_ms", 90)),
             sync_mode=sync_mode,
             ffmpeg_path=str(data.get("ffmpeg_path", "")),

@@ -51,9 +51,14 @@ class DubbingProjectStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        # WAL + a generous busy_timeout let the UI autosave (metadata writes) and
+        # the worker (per-cue checkpoints) write concurrently without
+        # "database is locked" errors.
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 30000")
         try:
             yield connection
             connection.commit()
@@ -127,6 +132,8 @@ class DubbingProjectStore:
                     attempt_count INTEGER DEFAULT 0,
                     native_speed_factor REAL,
                     generation_fingerprint TEXT DEFAULT '',
+                    legacy_audio_unverified INTEGER DEFAULT 0,
+                    legacy_observed_fingerprint TEXT DEFAULT '',
                     hard_speed_override REAL DEFAULT 0,
                     force_fit INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL,
@@ -176,6 +183,8 @@ class DubbingProjectStore:
             "safe_end_ms": "INTEGER",
             "timing_diff_ms": "INTEGER",
             "generation_fingerprint": "TEXT DEFAULT ''",
+            "legacy_audio_unverified": "INTEGER DEFAULT 0",
+            "legacy_observed_fingerprint": "TEXT DEFAULT ''",
             "hard_speed_override": "REAL DEFAULT 0",
             "force_fit": "INTEGER DEFAULT 0",
         }
@@ -313,8 +322,9 @@ class DubbingProjectStore:
             if project_db_id is None:
                 raise ValueError(f"Project not found: {project_id}")
             values = self._cue_row_values(cue, now)
+            placeholders = ",".join(["?"] * (len(values) + 1))
             connection.execute(
-                """
+                f"""
                 INSERT INTO dubbing_cues (
                     project_id, cue_id, sequence, start_ms, end_ms,
                     duration_budget_ms, source_text, spoken_text,
@@ -325,9 +335,11 @@ class DubbingProjectStore:
                     status, fitting_strategy, warning_codes_json,
                     error_message, enabled, is_stale, attempt_count,
                     native_speed_factor, generation_fingerprint,
-                    hard_speed_override, force_fit, created_at, updated_at
+                    legacy_audio_unverified, legacy_observed_fingerprint,
+                    hard_speed_override, force_fit,
+                    created_at, updated_at
                 )
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES ({placeholders})
                 ON CONFLICT(project_id, cue_id) DO UPDATE SET
                     sequence=excluded.sequence,
                     start_ms=excluded.start_ms,
@@ -355,6 +367,8 @@ class DubbingProjectStore:
                     attempt_count=excluded.attempt_count,
                     native_speed_factor=excluded.native_speed_factor,
                     generation_fingerprint=excluded.generation_fingerprint,
+                    legacy_audio_unverified=excluded.legacy_audio_unverified,
+                    legacy_observed_fingerprint=excluded.legacy_observed_fingerprint,
                     hard_speed_override=excluded.hard_speed_override,
                     force_fit=excluded.force_fit,
                     updated_at=excluded.updated_at
@@ -478,7 +492,8 @@ class DubbingProjectStore:
             "target_duration_ms, safe_end_ms, timing_diff_ms, status, "
             "fitting_strategy, warning_codes_json, error_message, enabled, "
             "is_stale, attempt_count, native_speed_factor, "
-            "generation_fingerprint, hard_speed_override, force_fit "
+            "generation_fingerprint, legacy_audio_unverified, "
+            "legacy_observed_fingerprint, hard_speed_override, force_fit "
             "FROM dubbing_cues"
         )
 
@@ -604,6 +619,8 @@ class DubbingProjectStore:
             cue.attempt_count,
             cue.native_speed_factor,
             cue.generation_fingerprint or "",
+            1 if cue.legacy_audio_unverified else 0,
+            cue.legacy_observed_fingerprint or "",
             cue.hard_speed_override,
             1 if cue.force_fit else 0,
             now,
@@ -618,8 +635,9 @@ class DubbingProjectStore:
         now: str,
     ) -> None:
         values = self._cue_row_values(cue, now)
+        placeholders = ",".join(["?"] * (len(values) + 1))
         connection.execute(
-            """
+            f"""
             INSERT INTO dubbing_cues (
                 project_id, cue_id, sequence, start_ms, end_ms,
                 duration_budget_ms, source_text, spoken_text,
@@ -630,9 +648,11 @@ class DubbingProjectStore:
                 status, fitting_strategy, warning_codes_json,
                 error_message, enabled, is_stale, attempt_count,
                 native_speed_factor, generation_fingerprint,
-                hard_speed_override, force_fit, created_at, updated_at
+                legacy_audio_unverified, legacy_observed_fingerprint,
+                hard_speed_override, force_fit,
+                created_at, updated_at
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES ({placeholders})
             """,
             (project_db_id, *values),
         )
@@ -740,6 +760,10 @@ class DubbingProjectStore:
             attempt_count=int(row["attempt_count"] or 0),
             native_speed_factor=_opt_float("native_speed_factor"),
             generation_fingerprint=str(row["generation_fingerprint"] or ""),
+            legacy_audio_unverified=bool(row["legacy_audio_unverified"]),
+            legacy_observed_fingerprint=str(
+                row["legacy_observed_fingerprint"] or ""
+            ),
             hard_speed_override=float(row["hard_speed_override"] or 0),
             force_fit=bool(row["force_fit"]),
         )
@@ -775,6 +799,8 @@ class DubbingProjectStore:
             "attempt_count": cue.attempt_count,
             "native_speed_factor": cue.native_speed_factor,
             "generation_fingerprint": cue.generation_fingerprint,
+            "legacy_audio_unverified": cue.legacy_audio_unverified,
+            "legacy_observed_fingerprint": cue.legacy_observed_fingerprint,
             "hard_speed_override": cue.hard_speed_override,
             "force_fit": cue.force_fit,
         }
@@ -898,6 +924,10 @@ class DubbingProjectStore:
                 else None
             ),
             generation_fingerprint=str(data.get("generation_fingerprint") or ""),
+            legacy_audio_unverified=bool(data.get("legacy_audio_unverified", False)),
+            legacy_observed_fingerprint=str(
+                data.get("legacy_observed_fingerprint") or ""
+            ),
             hard_speed_override=float(data.get("hard_speed_override") or 0),
             force_fit=bool(data.get("force_fit", False)),
         )

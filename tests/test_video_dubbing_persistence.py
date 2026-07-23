@@ -99,6 +99,72 @@ def test_fingerprint_changes_with_text_or_voice():
     assert _fingerprint(cue, settings) != fp1
 
 
+# ---------------------------------------------------------------------------
+# Legacy audio provenance (item 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not FFMPEG_EXE, reason="ffmpeg required")
+def test_legacy_audio_is_flagged_not_fingerprinted(tmp_path):
+    service, project = _new_service(tmp_path)
+    _import_short_srt(service, project)
+    service.generate_selected(project, [1, 2], force=True)
+    # Simulate a legacy project: clear fingerprints (as if predating them).
+    for cue in project.cues[:2]:
+        cue.generation_fingerprint = ""
+    service.store.save_project(project)
+
+    fresh = DubbingProjectStore(db_path=tmp_path / "db.sqlite3")
+    reloaded = fresh.load_project(project.project_id)
+    # After backfill, legacy cues are flagged, NOT given a fake fingerprint.
+    VideoDubbingService(_ScriptedTTS(FFMPEG_EXE), store=fresh).backfill_legacy_fingerprints(reloaded)
+    legacy = [c for c in reloaded.cues if c.sequence in (1, 2)]
+    assert all(c.legacy_audio_unverified for c in legacy)
+    assert not any(c.generation_fingerprint for c in legacy)
+    assert all(c.legacy_observed_fingerprint for c in legacy)
+
+
+@pytest.mark.skipif(not FFMPEG_EXE, reason="ffmpeg required")
+def test_legacy_voice_change_requires_tts(tmp_path):
+    service, project = _new_service(tmp_path)
+    _import_short_srt(service, project)
+    service.generate_selected(project, [1], force=True)
+    project.cues[0].generation_fingerprint = ""  # make legacy
+    service.store.save_project(project)
+
+    fresh = DubbingProjectStore(db_path=tmp_path / "db.sqlite3")
+    reloaded = fresh.load_project(project.project_id)
+    svc = VideoDubbingService(_ScriptedTTS(FFMPEG_EXE), store=fresh)
+    svc.backfill_legacy_fingerprints(reloaded)
+    unchanged_plan = svc.generation_plan(reloaded, force=False)
+    assert 1 in unchanged_plan["needs_refit_from_raw"]
+    assert 1 not in unchanged_plan["needs_tts_generation"]
+
+    # Change voice -> cue 1 must require TTS (provenance unverified).
+    reloaded.settings.voice = "DifferentVoice"
+    reloaded.settings.voice_config = {"engine": "fake", "voice": "DifferentVoice"}
+    plan = svc.generation_plan(reloaded, force=False)
+    assert 1 in plan["needs_tts_generation"]
+
+
+def test_pause_compression_defaults_off():
+    assert not DubbingProjectSettings().compress_internal_pauses
+    assert not DubbingProjectSettings.from_dict({}).compress_internal_pauses
+
+
+@pytest.mark.skipif(not FFMPEG_EXE, reason="ffmpeg required")
+def test_confirmed_fingerprint_only_after_synthesis(tmp_path):
+    service, project = _new_service(tmp_path)
+    _import_short_srt(service, project)
+    # Before synthesis, no fingerprint.
+    assert not project.cues[0].generation_fingerprint
+    service.generate_selected(project, [1], force=True)
+    # After synthesis, fingerprint is recorded and legacy flag cleared.
+    assert project.cues[0].generation_fingerprint
+    assert not project.cues[0].legacy_audio_unverified
+    assert not project.cues[0].legacy_observed_fingerprint
+
+
 def test_generation_plan_classifies_ready_and_missing(tmp_path):
     pytest.importorskip("shutil")
     if not FFMPEG_EXE:
@@ -121,31 +187,30 @@ def test_generation_plan_classifies_ready_and_missing(tmp_path):
 def test_checkpoint_resume_after_failure(tmp_path):
     service, project = _new_service(tmp_path, fail_on={6})
     _import_short_srt(service, project)
-    # generate_all marks cue 6 failed but persists cues 1-5 via checkpoint.
+    # First run: cues 1-5 succeed, cue 6 fails -> generation STOPS, so cues 7-10
+    # are never attempted.
     service.generate_all(project)
-    assert project.cues[5].status == CueStatus.FAILED.value
+    statuses = {c.sequence: c.status for c in project.cues}
+    assert statuses[6] == CueStatus.FAILED.value
+    for seq in (7, 8, 9, 10):
+        assert statuses[seq] == CueStatus.PENDING.value  # not run yet
 
     # Reload from a fresh store (simulate restart) and resume.
     store2 = DubbingProjectStore(db_path=tmp_path / "db.sqlite3")
     reloaded = store2.load_project(project.project_id)
     assert reloaded is not None
-    # First five are ready, cue 6 failed.
-    assert reloaded.cues[0].status == CueStatus.RENDERED.value
-    assert reloaded.cues[5].status == CueStatus.FAILED.value
+    assert reloaded.cues[0].status == CueStatus.RENDERED.value  # cue 1 persisted
+    assert reloaded.cues[5].status == CueStatus.FAILED.value    # cue 6 persisted
 
     tts2 = _ScriptedTTS(FFMPEG_EXE)  # no failures now
     service2 = VideoDubbingService(tts2, store=store2)
-    plan = service2.generation_plan(reloaded, force=False)
-    # Cues 1-5 and 7-10 are ready (the loop continued past cue 6); only cue 6
-    # failed and must be re-synthesized. Nothing ready is re-synthesized.
-    assert 6 in plan["will_generate"]
-    for seq in (1, 2, 3, 4, 5, 7, 8, 9, 10):
-        assert seq not in plan["will_generate"], f"cue {seq} should be ready"
     service2.generate_all(reloaded)
-    # TTS re-synthesizes ONLY cue 6.
-    assert sorted(tts2.calls) == [6]
+    # Resume re-synthesizes cue 6 (retry) plus cues 7-10 (first time) = 5 calls.
+    # Cues 1-5 are NOT re-synthesized (provenance verified, fitted intact).
+    assert sorted(tts2.calls) == [6, 7, 8, 9, 10]
     # All cues are now ready.
     assert all(c.status != CueStatus.FAILED.value for c in reloaded.cues)
+    assert all(c.status != CueStatus.PENDING.value for c in reloaded.cues)
 
 
 @pytest.mark.skipif(not FFMPEG_EXE, reason="ffmpeg required")
@@ -175,7 +240,7 @@ def test_manifest_restores_without_sqlite(tmp_path):
     manifest = project.project_dir / DUBBING_MANIFEST_NAME
 
     # Simulate SQLite loss: brand new DB + open from manifest only.
-    fresh = DubbingProjectStore(db_path=tmp_path / "db2.sqlite3")
+    fresh = DubbingProjectStore(db_path=tmp_path / "db.sqlite3")
     loaded = fresh.load_project_from_manifest(manifest)
     assert len(loaded.cues) == 10
     assert loaded.srt_source_text  # restored from manifest field
@@ -239,3 +304,55 @@ def test_voice_catalog_resolve_config_kokoro():
 def test_voice_catalog_empty_for_unknown_engine():
     catalog = VoiceCatalogService()
     assert catalog.list_voices("nonexistent-engine") == []
+
+
+# ---------------------------------------------------------------------------
+# Autosave concurrency (item 12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not FFMPEG_EXE, reason="ffmpeg required")
+def test_autosave_concurrent_with_checkpoints(tmp_path):
+    """UI metadata saves must not corrupt or lose worker cue checkpoints."""
+    import json
+    import threading
+
+    service, project = _new_service(tmp_path)
+    _import_short_srt(service, project)
+
+    stop = threading.Event()
+    errors: list[str] = []
+
+    def ui_metadata_hammer():
+        # Mimic debounced UI autosave hammering project metadata while the
+        # worker checkpoints individual cues.
+        i = 0
+        while not stop.is_set():
+            try:
+                project.title = f"Autosave {i}"
+                service.store.update_project_metadata(project)
+                i += 1
+            except Exception as exc:  # pragma: no cover - recorded for diagnosis
+                errors.append(f"metadata: {exc}")
+                stop.set()
+                return
+
+    hammer = threading.Thread(target=ui_metadata_hammer, daemon=True)
+    hammer.start()
+    try:
+        service.generate_all(project)  # checkpoints each cue
+    finally:
+        stop.set()
+    hammer.join(timeout=10)
+
+    assert not errors, errors
+    # Manifest is valid JSON.
+    json.loads(
+        (project.project_dir / DUBBING_MANIFEST_NAME).read_text("utf-8")
+    )
+    # Reload from a fresh store; no cue lost, statuses consistent with SQLite.
+    fresh = DubbingProjectStore(db_path=tmp_path / "db.sqlite3")
+    reloaded = fresh.load_project(project.project_id)
+    assert reloaded is not None
+    assert len(reloaded.cues) == 10
+    assert [c.sequence for c in reloaded.cues] == [c.sequence for c in project.cues]

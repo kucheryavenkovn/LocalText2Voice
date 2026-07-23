@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .models import CueStatus, DubbingCue, DubbingProject
+from .models import CueStatus, DubbingProject
 
 
 @dataclass

@@ -38,7 +38,7 @@ class CueGenerationConfig:
     trim_silence: bool = True
     silence_threshold_db: float = -40.0
     fade_ms: int = 8
-    compress_internal_pauses: bool = True
+    compress_internal_pauses: bool = False
     internal_pause_keep_ms: int = 90
     timing_tolerance_ms: int = 20
 
