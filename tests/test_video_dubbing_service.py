@@ -139,8 +139,11 @@ def test_full_pipeline_generate_render_mix_export(tmp_path, fake_project):
     # cue2 mild speedup (2.4/2.0=1.2 within 1.35)
     assert c2.applied_speed_factor > 1.0
     assert c2.overflow_ms == 0
-    # cue3 budget 1s, raw 2s -> factor 2.0 > 1.35 -> best_effort overflow
-    assert c3.overflow_ms > 0
+    # cue3 budget 1s, raw 2s -> required 2.0 in (1.35, 2.5) -> strong_speed_up,
+    # fits exactly to target with no overflow.
+    assert c3.status == "strong_speed_up"
+    assert c3.overflow_ms == 0
+    assert abs(c3.fitted_duration_ms - 1000) <= 20
 
     narration = service.render_narration(project)
     assert narration.is_file()
@@ -176,13 +179,18 @@ def test_regenerate_single_cue_invalidates_downstream(tmp_path, fake_project):
     assert narration_v2.is_file()
 
 
-def test_strict_mode_blocks_export(tmp_path, fake_project):
+def test_extreme_factor_blocks_export(tmp_path, fake_project):
     service, project = fake_project
+    # Make cue 3 require an extreme factor: budget 0.5s, raw 2.0s -> 4.0 > 2.5
+    c3 = project.cues[2]
+    c3.start_ms = 9000
+    c3.end_ms = 9500
+    c3.duration_budget_ms = 500
     project.settings.sync_mode = SyncMode.STRICT
     service.generate_all(project)
     can, blockers = service.can_export(project)
     assert can is False
-    assert any("shortening" in b for b in blockers)
+    assert any("extreme" in b for b in blockers)
 
 
 def test_project_round_trip_persistence(tmp_path, fake_project):

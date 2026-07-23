@@ -94,7 +94,9 @@ def test_timeline_widget_paints(app):
 def test_build_settings_round_trip(app):
     page = VideoDubbingPage(_tr, ffmpeg_path="ffmpeg/ffmpeg.exe", default_output_dir=".")
     settings = page._build_settings()
-    assert settings.max_speed_factor == 1.35
+    assert settings.preferred_speed_limit == 1.35
+    assert settings.hard_speed_limit == 2.50
+    assert settings.guard_gap_ms == 20
     assert settings.ducking.original_during_percent == 15
     assert settings.export.container.value == "mkv"
 
@@ -103,5 +105,5 @@ def test_engine_context_injected(app):
     page = VideoDubbingPage(_tr, ffmpeg_path="ffmpeg/ffmpeg.exe", default_output_dir=".")
     page.set_engine_context(None, {"engine": "kokoro", "voice": "af_heart"}, "ffmpeg/ff.exe")
     assert page._voice_config_override["engine"] == "kokoro"
-    assert page.voice_edit.text() == "af_heart"
+    assert page.voice_combo.currentText() == "af_heart"
     assert page._ffmpeg_path == "ffmpeg/ff.exe"

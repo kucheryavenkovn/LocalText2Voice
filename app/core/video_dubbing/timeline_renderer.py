@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,17 +38,24 @@ class PlacedSegment:
     duration_ms: int
 
 
+# Conservative per-command limits to stay well under the Windows 8191-char
+# command-line ceiling even with long Unicode paths.
+MAX_CUE_INPUTS_PER_BATCH = 24
+MAX_BATCH_MIX_INPUTS = 16
+SAFE_COMMAND_CHAR_BUDGET = 7000
+
+
 class TimelineRenderer:
     """Builds the single narration track of exact video duration.
 
-    Each fitted cue is placed at its absolute SRT timecode (start_ms +
-    placement_offset_ms). Silence fills the gaps. Cues are never concatenated
-    sequentially, so there is no cumulative drift.
+    Each fitted cue is placed at its absolute SRT timecode. Cues are never
+    concatenated sequentially, so there is no cumulative drift.
 
-    Rendering is split into fixed time windows so thousands of cues do not
-    exceed the Windows command-line length limit. A cue crossing a window
-    boundary is split deterministically across the windows it intersects, then
-    reassembled by window concatenation.
+    Rendering is split into fixed time windows, and each window is rendered in
+    bounded input batches (``MAX_CUE_INPUTS_PER_BATCH``). Large filter graphs
+    are written to a ``-filter_complex_script`` file and windows are joined via
+    the concat demuxer with a list file, so neither the command line nor the
+    filter graph can exceed the Windows limit (no ``[WinError 206]``).
     """
 
     DEFAULT_WINDOW_SECONDS = 300.0
@@ -58,6 +66,7 @@ class TimelineRenderer:
         sample_rate: int = 48000,
         channels: int = 2,
         window_seconds: float | None = None,
+        max_cue_inputs_per_batch: int = MAX_CUE_INPUTS_PER_BATCH,
         progress_callback: ProgressCallback | None = None,
         log_callback: LogCallback | None = None,
     ) -> None:
@@ -68,6 +77,7 @@ class TimelineRenderer:
             window_seconds if window_seconds and window_seconds > 0
             else self.DEFAULT_WINDOW_SECONDS
         )
+        self.max_cue_inputs_per_batch = max(2, int(max_cue_inputs_per_batch))
         self.progress_callback = progress_callback or (lambda c, t, msg: None)
         self.log_callback = log_callback or (lambda msg: None)
         self._cancel_requested = threading.Event()
@@ -129,6 +139,8 @@ class TimelineRenderer:
         segments.sort(key=lambda seg: seg.absolute_start_ms)
         return segments
 
+    # ------------------------------------------------------------------ render
+
     def render(
         self,
         project: DubbingProject,
@@ -163,12 +175,12 @@ class TimelineRenderer:
                 f"Rendering timeline window {index}/{len(windows)}...",
             )
             window_path = work_dir / f"window_{index:04d}.wav"
-            self._render_window(window, window_path)
+            self._render_window(window, window_path, work_dir, index)
             window_paths.append(window_path)
 
         self._check_cancelled()
         self.progress_callback(total - 1, total, "Concatenating timeline windows...")
-        self._concat_and_trim(window_paths, output_path, duration_ms / 1000.0)
+        self._concat_windows(window_paths, output_path, duration_ms / 1000.0, work_dir)
         self.progress_callback(total, total, "Narration track assembled.")
         self.log_callback(
             f"Narration track rendered: {duration_ms} ms "
@@ -196,8 +208,70 @@ class TimelineRenderer:
             cursor = end
         return windows
 
-    def _render_window(self, window: _Window, output_path: Path) -> None:
+    # ------------------------------------------------------------------ window
+
+    def _render_window(
+        self,
+        window: _Window,
+        output_path: Path,
+        work_dir: Path,
+        window_index: int,
+    ) -> None:
         window_duration_s = (window.end_ms - window.start_ms) / 1000.0
+        clipped = self._clip_segments_to_window(window)
+        if not clipped:
+            self._render_silence(output_path, window_duration_s)
+            return
+
+        batch_dir = work_dir / f"window_{window_index:04d}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        batches = [
+            clipped[i : i + self.max_cue_inputs_per_batch]
+            for i in range(0, len(clipped), self.max_cue_inputs_per_batch)
+        ]
+        batch_paths: list[Path] = []
+        for batch_index, batch in enumerate(batches, start=1):
+            self._check_cancelled()
+            batch_path = batch_dir / f"batch_{batch_index:04d}.wav"
+            self._render_batch(batch, window_duration_s, batch_path, batch_dir)
+            batch_paths.append(batch_path)
+
+        # Mix the (bounded number of) batch tracks into the final window WAV.
+        if len(batch_paths) == 1:
+            batch_paths[0].replace(output_path)
+        else:
+            self._mix_batches(batch_paths, output_path, window_duration_s, batch_dir)
+
+    def _clip_segments_to_window(
+        self, window: _Window
+    ) -> list[tuple[PlacedSegment, int, int, float]]:
+        """Return (segment, local_position_ms, segment_duration_ms, input_seek_s)
+        clipped to the window. A cue crossing a boundary contributes only its
+        in-window portion; the remainder is handled by the neighbouring window.
+        ``input_seek_s`` is where to start reading inside the source cue file.
+        """
+        clipped: list[tuple[PlacedSegment, int, int, float]] = []
+        for seg in window.segments:
+            seg_start = seg.absolute_start_ms
+            in_window_start_ms = max(window.start_ms, seg_start)
+            in_window_end_ms = min(window.end_ms, seg_start + seg.duration_ms)
+            if in_window_end_ms <= in_window_start_ms:
+                continue
+            local_position_ms = in_window_start_ms - window.start_ms
+            segment_duration_ms = in_window_end_ms - in_window_start_ms
+            input_seek_s = max(0.0, (in_window_start_ms - seg_start) / 1000.0)
+            clipped.append(
+                (seg, local_position_ms, segment_duration_ms, input_seek_s)
+            )
+        return clipped
+
+    def _render_batch(
+        self,
+        batch: list[tuple[PlacedSegment, int, int, float]],
+        window_duration_s: float,
+        output_path: Path,
+        work_dir: Path,
+    ) -> None:
         fmt = self._audio_format_filter()
         arguments: list[str] = [
             "-y",
@@ -211,22 +285,13 @@ class TimelineRenderer:
             "-i",
             self._silence_lavfi(),
         ]
-        prepared: list[tuple[int, int, float, int]] = []
+        prepared: list[tuple[int, int, int]] = []
         input_index = 1
-        for seg in window.segments:
-            seg_start = seg.absolute_start_ms
-            cue_offset_start_s = max(0.0, (window.start_ms - seg_start) / 1000.0)
-            cue_offset_end_s = min(
-                seg.duration_ms, window.end_ms - seg_start
-            ) / 1000.0
-            if cue_offset_end_s <= cue_offset_start_s:
-                continue
-            local_position_ms = max(0, seg_start - window.start_ms)
-            segment_duration_ms = int(round((cue_offset_end_s - cue_offset_start_s) * 1000))
-            arguments.extend(["-ss", f"{cue_offset_start_s:.3f}"])
+        for seg, local_position_ms, segment_duration_ms, input_seek_s in batch:
+            arguments.extend(["-ss", f"{input_seek_s:.3f}"])
             arguments.extend(["-t", f"{segment_duration_ms / 1000.0:.3f}"])
             arguments.extend(["-i", str(seg.audio_path)])
-            prepared.append((input_index, local_position_ms, cue_offset_start_s, segment_duration_ms))
+            prepared.append((input_index, local_position_ms, segment_duration_ms))
             input_index += 1
 
         filters: list[str] = []
@@ -234,7 +299,7 @@ class TimelineRenderer:
             f"[0:a]{fmt},atrim=duration={window_duration_s:.3f},asetpts=N/SR/TB[base]"
         )
         labels = ["[base]"]
-        for index, (input_idx, local_position_ms, _cue_offset, segment_duration_ms) in enumerate(
+        for index, (input_idx, local_position_ms, segment_duration_ms) in enumerate(
             prepared, start=1
         ):
             label = f"seg{index}"
@@ -252,14 +317,61 @@ class TimelineRenderer:
             f"{mix_inputs}amix=inputs={len(labels)}:duration=first:normalize=0,"
             f"atrim=duration={window_duration_s:.3f},asetpts=N/SR/TB[out]"
         )
-        arguments.extend(["-filter_complex", ";".join(filters), "-map", "[out]"])
-        arguments.extend(["-codec:a", "pcm_s16le", str(output_path)])
+        graph = ";".join(filters)
+
+        use_script, script_path = self._maybe_write_filter_script(graph, work_dir)
+        if use_script:
+            arguments.extend(["-filter_complex_script", str(script_path)])
+        else:
+            arguments.extend(["-filter_complex", graph])
+        arguments.extend(["-map", "[out]", "-codec:a", "pcm_s16le", str(output_path)])
+
+        self._assert_safe_command(arguments)
         try:
             self._runner_instance().run(arguments)
         except FFmpegCancelled as exc:
             raise TimelineRenderCancelled(str(exc)) from exc
         except FFmpegError as exc:
-            raise TimelineRenderError(f"Could not render window: {exc}") from exc
+            raise TimelineRenderError(
+                f"Could not render timeline batch: {exc}"
+            ) from exc
+
+    def _mix_batches(
+        self,
+        batch_paths: list[Path],
+        output_path: Path,
+        window_duration_s: float,
+        work_dir: Path,
+    ) -> None:
+        fmt = self._audio_format_filter()
+        arguments: list[str] = ["-y", "-hide_banner", "-loglevel", "error"]
+        for path in batch_paths:
+            arguments.extend(["-i", str(path)])
+        filters: list[str] = []
+        labels: list[str] = []
+        for index in range(len(batch_paths)):
+            label = f"b{index}"
+            filters.append(f"[{index}:a]{fmt}[{label}]")
+            labels.append(f"[{label}]")
+        mix_inputs = "".join(labels)
+        filters.append(
+            f"{mix_inputs}amix=inputs={len(labels)}:duration=longest:normalize=0,"
+            f"atrim=duration={window_duration_s:.3f},asetpts=N/SR/TB[out]"
+        )
+        graph = ";".join(filters)
+        use_script, script_path = self._maybe_write_filter_script(graph, work_dir)
+        if use_script:
+            arguments.extend(["-filter_complex_script", str(script_path)])
+        else:
+            arguments.extend(["-filter_complex", graph])
+        arguments.extend(["-map", "[out]", "-codec:a", "pcm_s16le", str(output_path)])
+        self._assert_safe_command(arguments)
+        try:
+            self._runner_instance().run(arguments)
+        except FFmpegCancelled as exc:
+            raise TimelineRenderCancelled(str(exc)) from exc
+        except FFmpegError as exc:
+            raise TimelineRenderError(f"Could not mix timeline batches: {exc}") from exc
 
     def _render_silence(self, output_path: Path, duration_seconds: float) -> None:
         arguments = [
@@ -288,45 +400,108 @@ class TimelineRenderer:
         except FFmpegError as exc:
             raise TimelineRenderError(f"Could not render silence: {exc}") from exc
 
-    def _concat_and_trim(
+    # ------------------------------------------------------------------ concat
+
+    def _concat_windows(
         self,
         window_paths: list[Path],
         output_path: Path,
         total_seconds: float,
+        work_dir: Path,
     ) -> None:
-        arguments: list[str] = ["-y", "-hide_banner", "-loglevel", "error"]
+        if len(window_paths) == 1:
+            self._trim_to_duration(window_paths[0], output_path, total_seconds)
+            return
+        # Use the concat demuxer with a list file (avoids one -i per window).
+        list_path = work_dir / "windows_concat.txt"
+        lines = []
         for path in window_paths:
-            arguments.extend(["-i", str(path)])
-        fmt = self._audio_format_filter()
-        filter_parts = [
-            f"[{index}:a]{fmt}[a{index}]"
-            for index in range(len(window_paths))
+            escaped = str(path).replace("'", r"\'")
+            lines.append(f"file '{escaped}'")
+        list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        arguments = [
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c:a",
+            "pcm_s16le",
+            "-ar",
+            str(self.sample_rate),
+            "-ac",
+            str(self.channels),
+            str(work_dir / "windows_concat.wav"),
         ]
-        concat_inputs = "".join(f"[a{index}]" for index in range(len(window_paths)))
-        filter_parts.append(
-            f"{concat_inputs}concat=n={len(window_paths)}:v=0:a=1[concat]"
-        )
-        filter_parts.append(
-            f"[concat]atrim=0:{total_seconds:.3f},asetpts=N/SR/TB[out]"
-        )
-        arguments.extend(["-filter_complex", ";".join(filter_parts), "-map", "[out]"])
-        arguments.extend(
-            [
-                "-codec:a",
-                "pcm_s16le",
-                "-ar",
-                str(self.sample_rate),
-                "-ac",
-                str(self.channels),
-                str(output_path),
-            ]
-        )
+        self._assert_safe_command(arguments)
         try:
             self._runner_instance().run(arguments)
         except FFmpegCancelled as exc:
             raise TimelineRenderCancelled(str(exc)) from exc
         except FFmpegError as exc:
             raise TimelineRenderError(f"Could not concatenate windows: {exc}") from exc
+        self._trim_to_duration(
+            work_dir / "windows_concat.wav", output_path, total_seconds
+        )
+
+    def _trim_to_duration(
+        self, source: Path, output_path: Path, total_seconds: float
+    ) -> None:
+        fmt = self._audio_format_filter()
+        graph = (
+            f"[0:a]{fmt},atrim=0:{total_seconds:.3f},asetpts=N/SR/TB[out]"
+        )
+        arguments = [
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source),
+            "-filter_complex",
+            graph,
+            "-map",
+            "[out]",
+            "-codec:a",
+            "pcm_s16le",
+            "-ar",
+            str(self.sample_rate),
+            "-ac",
+            str(self.channels),
+            str(output_path),
+        ]
+        try:
+            self._runner_instance().run(arguments)
+        except FFmpegCancelled as exc:
+            raise TimelineRenderCancelled(str(exc)) from exc
+        except FFmpegError as exc:
+            raise TimelineRenderError(f"Could not trim narration: {exc}") from exc
+
+    # ------------------------------------------------------------------ safety
+
+    @staticmethod
+    def _maybe_write_filter_script(
+        graph: str, work_dir: Path
+    ) -> tuple[bool, Path | None]:
+        if len(graph) <= 1500:
+            return False, None
+        script_path = work_dir / f"filter_{abs(hash(graph)) & 0xFFFFFFFF:08x}.txt"
+        script_path.write_text(graph, encoding="utf-8")
+        return True, script_path
+
+    @staticmethod
+    def _assert_safe_command(arguments: list[str]) -> None:
+        approx = sum(len(arg) + 3 for arg in arguments)
+        if approx > SAFE_COMMAND_CHAR_BUDGET:
+            raise TimelineRenderError(
+                f"FFmpeg command too long for Windows ({approx} chars > "
+                f"{SAFE_COMMAND_CHAR_BUDGET}). Reduce batch size."
+            )
 
 
 @dataclass

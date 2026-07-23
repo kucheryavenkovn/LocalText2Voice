@@ -150,21 +150,39 @@ def test_apply_fitting_mild_speedup(tmp_path):
     assert 3300 <= fitted_ms <= 3700
 
 
-def test_apply_fitting_strict_overflow_marks_shortening(tmp_path):
+def test_apply_fitting_strong_speedup_fits_to_target(tmp_path):
+    # raw 3.8s, budget 2s -> required 1.9 -> strong_speed_up (fits exactly)
     tts = FakeToneTTS(FFMPEG_EXE, duration_seconds=3.8)
     gen = CueGenerator(tts, ffmpeg_path="ffmpeg/ffmpeg.exe")
     settings = DubbingProjectSettings(
-        max_speed_factor=1.35, sync_mode=SyncMode.STRICT
+        preferred_speed_limit=1.35,
+        hard_speed_limit=2.5,
+        sync_mode=SyncMode.STRICT,
     )
-    fitter = DurationFitter(settings)
+    fitter = DurationFitter(settings, video_duration_ms=10_000)
     cue = _make_cue(1, 0, 2000, tmp_path)
     gen.generate_raw(cue, voice_config={})
     result = fitter.evaluate(cue)
-    assert result.status == CueStatus.NEEDS_SHORTENING.value
-    assert result.overflow_ms > 0
+    assert result.status == CueStatus.STRONG_SPEED_UP.value
+    assert result.fitted_duration_ms == 2000
     fitter.apply_result(cue, result)
-    assert cue.overflow_ms > 0
-    # Best-effort fit still produces a file but overflow remains.
     gen.apply_fitting(cue, result)
     assert cue.fitted_audio_path.is_file()
-    assert cue.overflow_ms > 0
+    fitted_ms = _wav_duration_ms(cue.fitted_audio_path)
+    # Second-pass correction lands within tolerance of the 2s target.
+    assert abs(fitted_ms - 2000) <= 40
+
+
+def test_apply_fitting_extreme_blocks_and_force(tmp_path):
+    # raw 6s, budget 2s -> required 3.0 > hard 2.5 -> extreme (blocking)
+    tts = FakeToneTTS(FFMPEG_EXE, duration_seconds=6.0)
+    gen = CueGenerator(tts, ffmpeg_path="ffmpeg/ffmpeg.exe")
+    settings = DubbingProjectSettings(
+        preferred_speed_limit=1.35, hard_speed_limit=2.5
+    )
+    fitter = DurationFitter(settings, video_duration_ms=10_000)
+    cue = _make_cue(1, 0, 2000, tmp_path)
+    gen.generate_raw(cue, voice_config={})
+    result = fitter.evaluate(cue)
+    assert result.status == CueStatus.EXTREME_SPEED_REQUIRED.value
+    assert result.blocking

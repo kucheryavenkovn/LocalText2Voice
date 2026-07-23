@@ -38,6 +38,9 @@ class CueGenerationConfig:
     trim_silence: bool = True
     silence_threshold_db: float = -40.0
     fade_ms: int = 8
+    compress_internal_pauses: bool = True
+    internal_pause_keep_ms: int = 90
+    timing_tolerance_ms: int = 20
 
 
 class CueGenerator:
@@ -157,32 +160,55 @@ class CueGenerator:
             shutil.copy2(cue.raw_audio_path, fitted_path)
             cue.fitted_duration_ms = cue.raw_duration_ms
         else:
-            filters = DurationFitter.build_atempo_chain(factor)
-            arguments = [
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(cue.raw_audio_path),
-                "-filter:a",
-                ",".join(filters),
-                "-ar",
-                str(self.config.sample_rate),
-                "-ac",
-                str(self.config.channels),
-                "-codec:a",
-                "pcm_s16le",
-                str(fitted_path),
-            ]
-            try:
-                self._runner().run(arguments)
-            except FFmpegCancelled as exc:
-                raise CueGenerationCancelled(str(exc)) from exc
-            except FFmpegError as exc:
-                raise CueGenerationError(str(exc)) from exc
+            self._apply_atempo(cue.raw_audio_path, fitted_path, factor)
             cue.fitted_duration_ms = self._measure_wav_duration_ms(fitted_path)
+            # Second-pass correction: hit the target within tolerance without
+            # ever trimming speech (only an atempo fine-adjustment).
+            target_ms = result.target_duration_ms
+            if (
+                target_ms
+                and cue.fitted_duration_ms
+                and abs(cue.fitted_duration_ms - target_ms)
+                > self.config.timing_tolerance_ms
+            ):
+                fine = cue.fitted_duration_ms / target_ms
+                if fine > 1.0:
+                    corrected = fitted_path.with_suffix(".corr.wav")
+                    self._apply_atempo(fitted_path, corrected, fine)
+                    corrected.replace(fitted_path)
+                    cue.fitted_duration_ms = self._measure_wav_duration_ms(fitted_path)
         return cue
+
+    def _apply_atempo(
+        self,
+        source: Path,
+        destination: Path,
+        factor: float,
+    ) -> None:
+        filters = DurationFitter.build_atempo_chain(factor)
+        arguments = [
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source),
+            "-filter:a",
+            ",".join(filters),
+            "-ar",
+            str(self.config.sample_rate),
+            "-ac",
+            str(self.config.channels),
+            "-codec:a",
+            "pcm_s16le",
+            str(destination),
+        ]
+        try:
+            self._runner().run(arguments)
+        except FFmpegCancelled as exc:
+            raise CueGenerationCancelled(str(exc)) from exc
+        except FFmpegError as exc:
+            raise CueGenerationError(str(exc)) from exc
 
     def _normalize_wav(self, raw_output: Path) -> Path:
         normalized = raw_output.with_suffix(".norm.wav")
@@ -199,6 +225,15 @@ class CueGenerator:
                 f"start_threshold={threshold}"
             )
             filters.append("areverse")
+        if self.config.compress_internal_pauses:
+            # Compress only long internal pauses down to a short kept segment,
+            # leaving speech untouched. This reduces the speedup needed.
+            keep = max(0.02, self.config.internal_pause_keep_ms / 1000.0)
+            threshold = f"{self.config.silence_threshold_db}dB"
+            filters.append(
+                "silenceremove=stop_periods=-1:"
+                f"stop_silence={keep:.3f}:stop_threshold={threshold}"
+            )
         if self.config.fade_ms > 0:
             fade = self.config.fade_ms / 1000.0
             filters.append(f"afade=t=in:st=0:d={fade:.4f}")

@@ -12,10 +12,33 @@ class CueStatus(str, Enum):
     RENDERED = "rendered"
     FITTED = "fitted"
     SPEED_UP = "speed_up"
+    STRONG_SPEED_UP = "strong_speed_up"
+    EXTREME_SPEED_REQUIRED = "extreme_speed_required"
     NEEDS_SHORTENING = "needs_text_shortening"
     FAILED = "failed"
+    MISSING_AUDIO = "missing_audio"
     DISABLED = "disabled"
     STALE = "stale"
+
+
+# Statuses that are considered "ready" and must not trigger TTS again.
+READY_STATUSES = frozenset(
+    {
+        CueStatus.RENDERED.value,
+        CueStatus.FITTED.value,
+        CueStatus.SPEED_UP.value,
+        CueStatus.STRONG_SPEED_UP.value,
+    }
+)
+
+# Statuses that always block export regardless of policy.
+BLOCKING_STATUSES = frozenset(
+    {
+        CueStatus.FAILED.value,
+        CueStatus.MISSING_AUDIO.value,
+        CueStatus.EXTREME_SPEED_REQUIRED.value,
+    }
+)
 
 
 class FittingStrategy(str, Enum):
@@ -74,6 +97,11 @@ class DubbingCue:
     placement_offset_ms: int = 0
     overflow_ms: int = 0
 
+    # New timing fields populated by the fitter.
+    target_duration_ms: int | None = None
+    safe_end_ms: int | None = None
+    timing_diff_ms: int | None = None
+
     status: str = CueStatus.PENDING.value
     fitting_strategy: str | None = None
     warning_codes: list[str] = field(default_factory=list)
@@ -85,11 +113,20 @@ class DubbingCue:
     attempt_count: int = 0
     native_speed_factor: float | None = None
 
+    # Fingerprint of the inputs that produced the current raw audio. When it
+    # matches the current inputs and the WAV is intact, the cue is reused
+    # instead of being re-synthesized.
+    generation_fingerprint: str = ""
+    # Per-cue override of the hard speed limit (0 = use project default).
+    hard_speed_override: float = 0.0
+    # Per-cue "force fit even beyond hard limit" flag.
+    force_fit: bool = False
+
     def mark_stale(self) -> None:
         self.is_stale = True
         if self.status not in {
             CueStatus.FAILED.value,
-            CueStatus.NEEDS_SHORTENING.value,
+            CueStatus.EXTREME_SPEED_REQUIRED.value,
         }:
             self.status = CueStatus.STALE.value
 
@@ -260,7 +297,15 @@ class DubbingProjectSettings:
     tts_engine: str = "piper"
     voice: str = ""
     voice_config: dict[str, Any] = field(default_factory=dict)
+    # Deprecated single limit kept for backward compatibility; mirrors
+    # preferred_speed_limit when loading old manifests.
     max_speed_factor: float = 1.35
+    preferred_speed_limit: float = 1.35
+    hard_speed_limit: float = 2.50
+    exact_timing: bool = True
+    guard_gap_ms: int = 20
+    compress_internal_pauses: bool = True
+    internal_pause_keep_ms: int = 90
     sync_mode: SyncMode = SyncMode.STRICT
     ffmpeg_path: str = ""
     sample_rate: int = 48000
@@ -276,6 +321,12 @@ class DubbingProjectSettings:
             "voice": self.voice,
             "voice_config": dict(self.voice_config),
             "max_speed_factor": self.max_speed_factor,
+            "preferred_speed_limit": self.preferred_speed_limit,
+            "hard_speed_limit": self.hard_speed_limit,
+            "exact_timing": self.exact_timing,
+            "guard_gap_ms": self.guard_gap_ms,
+            "compress_internal_pauses": self.compress_internal_pauses,
+            "internal_pause_keep_ms": self.internal_pause_keep_ms,
             "sync_mode": self.sync_mode.value,
             "ffmpeg_path": self.ffmpeg_path,
             "sample_rate": self.sample_rate,
@@ -295,12 +346,23 @@ class DubbingProjectSettings:
         voice_config = data.get("voice_config", {})
         if not isinstance(voice_config, dict):
             voice_config = {}
+        legacy_max = float(data.get("max_speed_factor", 1.35))
+        preferred = float(data.get("preferred_speed_limit", legacy_max))
+        hard = float(data.get("hard_speed_limit", max(2.5, preferred)))
+        if hard < preferred:
+            hard = preferred
         return cls(
             language=str(data.get("language", "")),
             tts_engine=str(data.get("tts_engine", "piper")),
             voice=str(data.get("voice", "")),
             voice_config=dict(voice_config),
-            max_speed_factor=float(data.get("max_speed_factor", 1.35)),
+            max_speed_factor=preferred,
+            preferred_speed_limit=preferred,
+            hard_speed_limit=hard,
+            exact_timing=bool(data.get("exact_timing", True)),
+            guard_gap_ms=int(data.get("guard_gap_ms", 20)),
+            compress_internal_pauses=bool(data.get("compress_internal_pauses", True)),
+            internal_pause_keep_ms=int(data.get("internal_pause_keep_ms", 90)),
             sync_mode=sync_mode,
             ffmpeg_path=str(data.get("ffmpeg_path", "")),
             sample_rate=int(data.get("sample_rate", 48000)),
@@ -360,6 +422,11 @@ class DubbingProject:
     final_video_path: Path | None = None
     full_preview_path: Path | None = None
     cue_preview_cache: dict[str, Path] = field(default_factory=dict)
+
+    # UI / playback restoration state.
+    selected_sequence: int | None = None
+    last_player_position_ms: int = 0
+    schema_version: int = 2
 
     @property
     def duration_ms(self) -> int:

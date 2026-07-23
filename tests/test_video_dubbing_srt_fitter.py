@@ -237,9 +237,19 @@ def test_parse_srt_file_missing_raises(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _fitter(max_factor: float = 1.35, mode: SyncMode = SyncMode.STRICT):
-    settings = DubbingProjectSettings(max_speed_factor=max_factor, sync_mode=mode)
-    return DurationFitter(settings)
+def _fitter(
+    preferred: float = 1.35,
+    hard: float = 2.50,
+    mode: SyncMode = SyncMode.STRICT,
+    video_duration_ms: int | None = 10_000,
+):
+    settings = DubbingProjectSettings(
+        preferred_speed_limit=preferred,
+        hard_speed_limit=hard,
+        max_speed_factor=preferred,
+        sync_mode=mode,
+    )
+    return DurationFitter(settings, video_duration_ms=video_duration_ms)
 
 
 def test_fitter_short_cue_no_speedup():
@@ -257,29 +267,50 @@ def test_fitter_exact_fit_no_speedup():
     assert result.strategy == FittingStrategy.NONE
 
 
-def test_fitter_mild_speedup_within_limit():
+def test_fitter_mild_speedup_within_preferred():
     cue = _make_cue(1, 5000, 8500, raw_ms=4100)  # 4.1/3.5 = 1.171
-    result = _fitter(max_factor=1.35).evaluate(cue)
+    result = _fitter(preferred=1.35).evaluate(cue)
     assert result.strategy == FittingStrategy.ATEMPO
     assert round(result.applied_speed_factor, 3) == 1.171
     assert result.overflow_ms == 0
     assert result.status == CueStatus.SPEED_UP.value
+    assert not result.blocking
 
 
-def test_fitter_strict_overflow_blocks_export():
-    cue = _make_cue(1, 0, 2000, raw_ms=3800)  # 1.9 > 1.35
-    result = _fitter(max_factor=1.35, mode=SyncMode.STRICT).evaluate(cue)
-    assert result.status == CueStatus.NEEDS_SHORTENING.value
-    assert result.overflow_ms > 0
-    assert "needs_text_shortening" in result.warning_codes
+def test_fitter_strong_speedup_fits_exactly_with_warning():
+    cue = _make_cue(1, 0, 2000, raw_ms=3800)  # 1.9 in (1.35, 2.5)
+    result = _fitter(preferred=1.35, hard=2.5).evaluate(cue)
+    assert result.status == CueStatus.STRONG_SPEED_UP.value
+    assert result.applied_speed_factor == pytest.approx(1.9, rel=1e-2)
+    assert result.fitted_duration_ms == 2000  # fits exactly to target
+    assert result.overflow_ms == 0
+    assert "strong_speed_up" in result.warning_codes
+    assert not result.blocking  # warning, not a block
 
 
-def test_fitter_best_effort_applies_max():
-    cue = _make_cue(1, 0, 2000, raw_ms=3800)
-    result = _fitter(max_factor=1.35, mode=SyncMode.BEST_EFFORT).evaluate(cue)
-    assert result.status == CueStatus.SPEED_UP.value
-    assert result.applied_speed_factor == 1.35
-    assert result.overflow_ms > 0
+def test_fitter_extreme_blocks_beyond_hard_limit():
+    cue = _make_cue(1, 0, 2000, raw_ms=6000)  # 3.0 > 2.5
+    result = _fitter(preferred=1.35, hard=2.5).evaluate(cue)
+    assert result.status == CueStatus.EXTREME_SPEED_REQUIRED.value
+    assert result.blocking is True
+
+
+def test_fitter_force_fit_overrides_hard_limit():
+    cue = _make_cue(1, 0, 2000, raw_ms=6000)
+    cue.force_fit = True
+    result = _fitter(preferred=1.35, hard=2.5).evaluate(cue)
+    assert result.status == CueStatus.STRONG_SPEED_UP.value
+    assert result.applied_speed_factor == pytest.approx(3.0, rel=1e-2)
+    assert result.fitted_duration_ms == 2000
+    assert not result.blocking
+
+
+def test_fitter_per_cue_hard_override():
+    cue = _make_cue(1, 0, 2000, raw_ms=6000)  # 3.0 > default hard 2.5
+    cue.hard_speed_override = 3.5
+    result = _fitter(preferred=1.35, hard=2.5).evaluate(cue)
+    assert result.status == CueStatus.STRONG_SPEED_UP.value
+    assert not result.blocking
 
 
 def test_fitter_apply_result_populates_cue():
@@ -290,12 +321,46 @@ def test_fitter_apply_result_populates_cue():
     assert cue.applied_speed_factor == pytest.approx(1.171, rel=1e-2)
     assert cue.fitting_strategy == FittingStrategy.ATEMPO.value
     assert cue.overflow_ms == 0
+    assert cue.target_duration_ms == 3500
+    assert cue.timing_diff_ms == 0
 
 
 def test_fitter_requires_raw_duration():
     cue = _make_cue(1, 0, 1000, raw_ms=None)
     with pytest.raises(ValueError):
         _fitter().evaluate(cue)
+
+
+def test_fitter_safe_end_uses_next_cue_gap():
+    fitter = _fitter()
+    cue = _make_cue(1, 4000, 7780, raw_ms=4000)
+    next_cue = _make_cue(2, 7790, 9000)  # close enough that the gap limits
+    safe_end = fitter.safe_end_ms(cue, next_cue)
+    assert safe_end == 7790 - 20  # guard gap 20 is the limit, not cue.end
+    target = fitter.target_duration_ms(cue, next_cue)
+    assert target == 3770
+
+
+def test_fitter_band_table_from_prompt():
+    cases = [
+        (3000, 1.0, CueStatus.RENDERED.value),
+        (3300, 1.10, CueStatus.SPEED_UP.value),
+        (4050, 1.35, CueStatus.SPEED_UP.value),
+        (4500, 1.50, CueStatus.STRONG_SPEED_UP.value),
+        (6000, 2.00, CueStatus.STRONG_SPEED_UP.value),
+        (6600, 2.20, CueStatus.STRONG_SPEED_UP.value),
+        (7500, 2.50, CueStatus.STRONG_SPEED_UP.value),
+        (9000, 3.00, CueStatus.EXTREME_SPEED_REQUIRED.value),
+    ]
+    for raw_ms, _expected_factor, expected_status in cases:
+        cue = _make_cue(1, 0, 3000, raw_ms=raw_ms)
+        result = _fitter(preferred=1.35, hard=2.50).evaluate(cue)
+        assert result.status == expected_status, (
+            f"raw={raw_ms}: got {result.status}, want {expected_status}"
+        )
+        if result.status != CueStatus.EXTREME_SPEED_REQUIRED.value:
+            assert result.fitted_duration_ms == 3000
+            assert result.timing_diff_ms == 0
 
 
 def test_placement_offset_alignment():
@@ -325,9 +390,10 @@ def test_atempo_chain_chains_for_small_factors():
 
 
 def test_fitter_very_short_window():
-    cue = _make_cue(1, 0, 100, raw_ms=400)  # factor 4 > 1.35
-    result = _fitter(max_factor=1.35, mode=SyncMode.STRICT).evaluate(cue)
-    assert result.status == CueStatus.NEEDS_SHORTENING.value
+    cue = _make_cue(1, 0, 100, raw_ms=400)  # factor 4 > hard 2.5
+    result = _fitter(preferred=1.35, hard=2.5).evaluate(cue)
+    assert result.status == CueStatus.EXTREME_SPEED_REQUIRED.value
+    assert result.blocking
 
 
 # ---------------------------------------------------------------------------
@@ -357,13 +423,15 @@ def test_settings_round_trip():
 
     settings = DubbingProjectSettings(
         language="ru",
-        max_speed_factor=1.4,
+        preferred_speed_limit=1.4,
+        hard_speed_limit=2.6,
         ducking=DuckingSettings(mode=OriginalAudioMode.CONSTANT),
     )
     data = settings.to_dict()
     restored = DubbingProjectSettings.from_dict(data)
     assert restored.language == "ru"
-    assert restored.max_speed_factor == 1.4
+    assert restored.preferred_speed_limit == 1.4
+    assert restored.hard_speed_limit == 2.6
     assert restored.ducking.mode == OriginalAudioMode.CONSTANT
 
 

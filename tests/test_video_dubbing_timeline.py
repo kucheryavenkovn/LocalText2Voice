@@ -13,7 +13,7 @@ from app.core.video_dubbing.models import (
     DubbingProject,
     VideoProbeInfo,
 )
-from app.core.video_dubbing.timeline_renderer import TimelineRenderer
+from app.core.video_dubbing.timeline_renderer import TimelineRenderer, TimelineRenderError
 
 FFMPEG_EXE = shutil.which("ffmpeg")
 pytestmark = pytest.mark.skipif(
@@ -162,3 +162,44 @@ def test_render_disabled_cue_excluded(tmp_path):
     renderer = TimelineRenderer("ffmpeg/ffmpeg.exe")
     placed = renderer.placed_segments(project.cues)
     assert [seg.sequence for seg in placed] == [2]
+
+
+# ---------------------------------------------------------------------------
+# WinError 206: batched rendering + command-length guard
+# ---------------------------------------------------------------------------
+
+
+def test_command_length_guard_rejects_huge_command():
+    import pytest as _pytest
+
+    huge = ["ffmpeg"] + ["-i"] + ["x" * 1000] * 30
+    with _pytest.raises(TimelineRenderError):
+        TimelineRenderer._assert_safe_command(huge)
+
+
+def test_batch_size_limits_inputs_per_window(tmp_path):
+    # 500 cues inside a single 60s window -> must split into batches of <=24.
+    specs = [(i * 100, i * 100 + 60, 50) for i in range(500)]
+    project = _project_with_cues(tmp_path, duration_ms=60_000, cue_specs=specs)
+    renderer = TimelineRenderer("ffmpeg/ffmpeg.exe", window_seconds=60, max_cue_inputs_per_batch=24)
+    windows = renderer._plan_windows(project.duration_ms, renderer.placed_segments(project.cues))
+    assert len(windows) == 1
+    clipped = renderer._clip_segments_to_window(windows[0])
+    assert len(clipped) == 500
+    batches = [clipped[i : i + 24] for i in range(0, len(clipped), 24)]
+    assert len(batches) == 21  # ceil(500/24)
+    assert all(len(b) <= 24 for b in batches)
+
+
+def test_render_large_timeline_500_cues(tmp_path):
+    # Scale requirement from the spec: at least 500 cues, must not hit
+    # WinError 206 and must produce an exact-length narration track.
+    specs = [(i * 100, i * 100 + 60, 50) for i in range(500)]
+    project = _project_with_cues(tmp_path, duration_ms=60_000, cue_specs=specs)
+    renderer = TimelineRenderer(
+        "ffmpeg/ffmpeg.exe", window_seconds=30, max_cue_inputs_per_batch=24
+    )
+    out = tmp_path / "narration.wav"
+    renderer.render(project, out)
+    assert out.is_file()
+    assert abs(_wav_duration_ms(out) - 60_000) <= 60

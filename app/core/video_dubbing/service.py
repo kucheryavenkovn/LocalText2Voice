@@ -47,9 +47,28 @@ from .video_muxer import VideoMuxError, VideoMuxer
 
 ProgressCallback = Callable[[str, int, int, str], None]
 LogCallback = Callable[[str], None]
+CueUpdatedCallback = Callable[[int, str, int, int, int], None]
 
 
 _module_logger = logging.getLogger("video_dubbing")
+
+
+def _fingerprint(cue: DubbingCue, settings: DubbingProjectSettings) -> str:
+    import hashlib
+    import json as _json
+
+    payload = {
+        "spoken_text": cue.spoken_text,
+        "engine": settings.tts_engine,
+        "voice": settings.voice,
+        "voice_config": settings.voice_config,
+        "language": settings.language,
+        "sample_rate": settings.sample_rate,
+        "channels": settings.channels,
+    }
+    return hashlib.sha256(
+        _json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 class VideoDubbingServiceError(RuntimeError):
@@ -89,11 +108,15 @@ class VideoDubbingService:
         store: DubbingProjectStore | None = None,
         progress_callback: ProgressCallback | None = None,
         log_callback: LogCallback | None = None,
+        cue_updated_callback: CueUpdatedCallback | None = None,
     ) -> None:
         self.tts_engine = tts_engine
         self.store = store or DubbingProjectStore()
         self.progress_callback = progress_callback or (lambda stage, c, t, msg: None)
         self.log_callback = log_callback or (lambda msg: None)
+        self.cue_updated_callback = cue_updated_callback or (
+            lambda seq, status, raw, fitted, index: None
+        )
         self._cancel_requested = threading.Event()
         self._active_cue_generator: CueGenerator | None = None
         self._active_timeline: TimelineRenderer | None = None
@@ -163,10 +186,23 @@ class VideoDubbingService:
         project = self.store.load_project(project_id)
         if project is None:
             raise VideoDubbingServiceError(f"Project not found: {project_id}")
+        self.backfill_legacy_fingerprints(project)
         return project
 
     def open_project_manifest(self, manifest_path: Path) -> DubbingProject:
-        return self.store.load_project_from_manifest(manifest_path)
+        project = self.store.load_project_from_manifest(manifest_path)
+        self.backfill_legacy_fingerprints(project)
+        return project
+
+    def backfill_legacy_fingerprints(self, project: DubbingProject) -> None:
+        """Trust already-synthesized legacy cues so they are never re-synthesized."""
+        changed = False
+        for cue in project.cues:
+            if not cue.generation_fingerprint and self._raw_intact(cue):
+                cue.generation_fingerprint = _fingerprint(cue, project.settings)
+                changed = True
+        if changed:
+            self.store.save_project(project)
 
     def list_projects(self) -> list[dict[str, Any]]:
         return self.store.list_projects()
@@ -260,88 +296,305 @@ class VideoDubbingService:
         config.setdefault("engine", project.settings.tts_engine)
         return config
 
+    @staticmethod
+    def _cue_is_complete(cue: DubbingCue) -> bool:
+        """True if the cue has intact raw+fitted WAV and recorded durations."""
+        from .models import READY_STATUSES
+
+        if cue.status not in READY_STATUSES and cue.status != CueStatus.FITTED.value:
+            return False
+        if cue.raw_audio_path is None or not Path(cue.raw_audio_path).is_file():
+            return False
+        if cue.fitted_audio_path is None or not Path(cue.fitted_audio_path).is_file():
+            return False
+        if cue.raw_duration_ms is None or cue.raw_duration_ms <= 0:
+            return False
+        if cue.fitted_duration_ms is None or cue.fitted_duration_ms <= 0:
+            return False
+        return True
+
+    @staticmethod
+    def _raw_intact(cue: DubbingCue) -> bool:
+        return (
+            cue.raw_audio_path is not None
+            and Path(cue.raw_audio_path).is_file()
+            and cue.raw_duration_ms is not None
+            and cue.raw_duration_ms > 0
+        )
+
+    def generation_plan(
+        self,
+        project: DubbingProject,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Classify cues into ready/missing/failed/will_generate/will_reuse.
+
+        ``will_generate`` = needs TTS re-synthesis (raw missing or inputs
+        changed). ``will_reuse`` = raw intact, only fitting must be re-run.
+        A ready cue is never re-synthesized.
+        """
+        will_generate: list[int] = []
+        will_reuse: list[int] = []
+        stale: list[int] = []
+        missing: list[int] = []
+        failed: list[int] = []
+        ready: list[int] = []
+        for cue in project.cues:
+            if not cue.enabled:
+                continue
+            current_fp = _fingerprint(cue, project.settings)
+            raw_intact = self._raw_intact(cue)
+            # One-time migration: legacy cues (no fingerprint) with intact raw
+            # are trusted on first open so a full project is never re-synthesized
+            # just because it predates fingerprinting.
+            if not cue.generation_fingerprint and raw_intact:
+                cue.generation_fingerprint = current_fp
+            same_inputs = bool(cue.generation_fingerprint) and (
+                cue.generation_fingerprint == current_fp
+            )
+            if cue.status == CueStatus.FAILED.value:
+                failed.append(cue.sequence)
+            if force:
+                will_generate.append(cue.sequence)
+                continue
+            needs_tts = (not raw_intact) or (not same_inputs)
+            if needs_tts:
+                will_generate.append(cue.sequence)
+                if not raw_intact:
+                    missing.append(cue.sequence)
+            elif self._cue_is_complete(cue):
+                ready.append(cue.sequence)
+            else:
+                # raw intact but fitted missing/inconsistent -> re-fit only.
+                will_reuse.append(cue.sequence)
+                stale.append(cue.sequence)
+        return {
+            "ready": ready,
+            "stale": stale,
+            "missing": missing,
+            "failed": failed,
+            "will_generate": will_generate,
+            "will_reuse": will_reuse,
+        }
+
     def generate_cue(
         self,
         project: DubbingProject,
         cue: DubbingCue,
+        force: bool = False,
     ) -> DubbingCue:
         voice_config = self._resolve_voice_config(project)
-        generator = CueGenerator(
-            self.tts_engine,
-            ffmpeg_path=project.settings.ffmpeg_path,
-            progress_callback=lambda c, t, msg: self.progress_callback("tts", c, t, msg),
-            log_callback=self.log_callback,
-        )
+        generator = self._make_generator(project)
         self._active_cue_generator = generator
         try:
-            generator.generate_raw(cue, voice_config)
-            fitter = DurationFitter(project.settings)
-            result = fitter.evaluate(cue)
-            fitter.apply_result(cue, result)
-            generator.apply_fitting(cue, result)
+            self._synthesize_and_fit(generator, project, cue, voice_config, force=force)
+            self.store.upsert_cue(project.project_id, cue)
+            self.store.write_manifest_atomic(project)
             invalidate_for_narration_change(project.stale)
         except CueGenerationError as exc:
             cue.status = CueStatus.FAILED.value
             cue.error_message = str(exc)
+            self.store.upsert_cue(project.project_id, cue)
             raise VideoDubbingServiceError(str(exc)) from exc
         finally:
             self._active_cue_generator = None
-        self.store.save_project(project)
         return cue
 
     def generate_selected(
         self,
         project: DubbingProject,
         sequences: list[int],
+        force: bool = True,
     ) -> list[DubbingCue]:
         targets = [c for c in project.cues if c.sequence in sequences and c.enabled]
-        self._begin_operation("generate_selected", count=len(targets))
+        self._begin_operation("generate_selected", count=len(targets), force=force)
         try:
-            return self._generate_many(project, targets)
+            return self._generate_many(project, targets, force=force)
         finally:
             self._end_operation("generate_selected", count=len(targets))
 
-    def generate_all(self, project: DubbingProject) -> list[DubbingCue]:
-        targets = [c for c in project.cues if c.enabled]
-        self._begin_operation("generate_all", cues=len(targets), total=len(project.cues))
+    def generate_all(
+        self,
+        project: DubbingProject,
+        force: bool = False,
+    ) -> list[DubbingCue]:
+        plan = self.generation_plan(project, force=force)
+        if force:
+            targets = [c for c in project.cues if c.enabled]
+        else:
+            need = set(plan["will_generate"]) | set(plan["will_reuse"])
+            targets = [c for c in project.cues if c.sequence in need]
+        self._log(
+            f"Ready: {len(plan['ready'])} | Stale: {len(plan['stale'])} | "
+            f"Missing: {len(plan['missing'])} | Failed: {len(plan['failed'])} | "
+            f"Will generate: {len(plan['will_generate'])} | "
+            f"Will reuse: {len(plan['will_reuse'])}"
+        )
+        self._begin_operation(
+            "generate_all", cues=len(targets), total=len(project.cues), force=force
+        )
         try:
-            return self._generate_many(project, targets)
+            return self._generate_many(project, targets, force=force)
         finally:
             self._end_operation("generate_all", cues=len(targets))
+
+    def re_fit_existing(self, project: DubbingProject) -> list[DubbingCue]:
+        """Re-fit existing raw WAV under the current speed policy WITHOUT TTS."""
+        targets = [
+            c
+            for c in project.cues
+            if c.enabled
+            and c.raw_audio_path
+            and Path(c.raw_audio_path).is_file()
+            and c.raw_duration_ms
+        ]
+        self._begin_operation("re_fit", cues=len(targets))
+        fitter = DurationFitter(project.settings, video_duration_ms=project.duration_ms)
+        cues_sorted = sorted(project.cues, key=lambda c: c.start_ms)
+        try:
+            for index, cue in enumerate(targets, start=1):
+                self._check_cancelled()
+                self.progress_callback("fitting", index - 1, len(targets), f"Cue #{cue.sequence}")
+                next_cue = self._next_cue(cues_sorted, cue)
+                self._refit_one(cue, fitter, next_cue, project)
+                self.store.upsert_cue(project.project_id, cue)
+                self.cue_updated_callback(
+                    cue.sequence, cue.status, cue.raw_duration_ms or 0,
+                    cue.fitted_duration_ms or 0, index,
+                )
+        finally:
+            self._end_operation("re_fit", cues=len(targets))
+        invalidate_for_narration_change(project.stale)
+        self.progress_callback("fitting", len(targets), len(targets), "Re-fit complete")
+        self.store.write_manifest_atomic(project)
+        return targets
 
     def _generate_many(
         self,
         project: DubbingProject,
         cues: list[DubbingCue],
+        force: bool = False,
     ) -> list[DubbingCue]:
         voice_config = self._resolve_voice_config(project)
-        fitter = DurationFitter(project.settings)
-        generator = CueGenerator(
-            self.tts_engine,
-            ffmpeg_path=project.settings.ffmpeg_path,
-            progress_callback=lambda c, t, msg: self.progress_callback("tts", c, t, msg),
-            log_callback=self.log_callback,
-        )
+        fitter = DurationFitter(project.settings, video_duration_ms=project.duration_ms)
+        generator = self._make_generator(project)
         self._active_cue_generator = generator
+        cues_sorted = sorted(project.cues, key=lambda c: c.start_ms)
         total = len(cues)
         try:
             for index, cue in enumerate(cues, start=1):
                 self._check_cancelled()
                 self.progress_callback("tts", index - 1, total, f"Cue #{cue.sequence}")
+                self.cue_updated_callback(
+                    cue.sequence, CueStatus.RENDERING.value, 0, 0, index
+                )
                 try:
-                    generator.generate_raw(cue, voice_config)
-                    result = fitter.evaluate(cue)
-                    fitter.apply_result(cue, result)
-                    generator.apply_fitting(cue, result)
+                    self._synthesize_and_fit(
+                        generator, project, cue, voice_config,
+                        force=force, fitter=fitter, cues_sorted=cues_sorted,
+                    )
+                    # checkpoint after every cue so resume never loses work.
+                    self.store.upsert_cue(project.project_id, cue)
+                    self.cue_updated_callback(
+                        cue.sequence, cue.status,
+                        cue.raw_duration_ms or 0, cue.fitted_duration_ms or 0, index,
+                    )
                 except CueGenerationError as exc:
                     cue.status = CueStatus.FAILED.value
                     cue.error_message = str(exc)
+                    self.store.upsert_cue(project.project_id, cue)
+                    self.cue_updated_callback(
+                        cue.sequence, cue.status, 0, 0, index
+                    )
                     self.log_callback(f"Cue #{cue.sequence} failed: {exc}")
         finally:
             self._active_cue_generator = None
+            self.progress_callback("tts", total, total, "Generation completed")
         invalidate_for_narration_change(project.stale)
-        self.store.save_project(project)
+        self.store.write_manifest_atomic(project)
         return cues
+
+    def _synthesize_and_fit(
+        self,
+        generator: CueGenerator,
+        project: DubbingProject,
+        cue: DubbingCue,
+        voice_config: dict[str, Any],
+        force: bool,
+        fitter: DurationFitter | None = None,
+        cues_sorted: list[DubbingCue] | None = None,
+    ) -> None:
+        current_fp = _fingerprint(cue, project.settings)
+        same_inputs = bool(cue.generation_fingerprint) and cue.generation_fingerprint == current_fp
+        needs_tts = force or not same_inputs or not (
+            cue.raw_audio_path and Path(cue.raw_audio_path).is_file() and cue.raw_duration_ms
+        )
+        if needs_tts:
+            generator.generate_raw(cue, voice_config)
+            cue.generation_fingerprint = current_fp
+        if fitter is None:
+            fitter = DurationFitter(project.settings, video_duration_ms=project.duration_ms)
+        if cues_sorted is None:
+            cues_sorted = sorted(project.cues, key=lambda c: c.start_ms)
+        next_cue = self._next_cue(cues_sorted, cue)
+        result = fitter.evaluate(cue, next_cue=next_cue)
+        fitter.apply_result(cue, result)
+        generator.apply_fitting(cue, result)
+
+    def _refit_one(
+        self,
+        cue: DubbingCue,
+        fitter: DurationFitter,
+        next_cue: DubbingCue | None,
+        project: DubbingProject,
+    ) -> None:
+        result = fitter.evaluate(cue, next_cue=next_cue)
+        fitter.apply_result(cue, result)
+        generator = self._make_generator(project)
+        generator.apply_fitting(cue, result)
+
+    @staticmethod
+    def _next_cue(cues_sorted: list[DubbingCue], cue: DubbingCue) -> DubbingCue | None:
+        for index, other in enumerate(cues_sorted):
+            if other.sequence == cue.sequence:
+                for candidate in cues_sorted[index + 1:]:
+                    if candidate.enabled and candidate.sequence != cue.sequence:
+                        return candidate
+        return None
+
+    def _make_generator(self, project: DubbingProject) -> CueGenerator:
+        from .cue_generator import CueGenerationConfig
+
+        config = CueGenerationConfig(
+            sample_rate=project.settings.sample_rate,
+            channels=project.settings.channels,
+            compress_internal_pauses=project.settings.compress_internal_pauses,
+            internal_pause_keep_ms=project.settings.internal_pause_keep_ms,
+        )
+        return CueGenerator(
+            self.tts_engine,
+            ffmpeg_path=project.settings.ffmpeg_path,
+            config=config,
+            progress_callback=lambda c, t, msg: self.progress_callback("tts", c, t, msg),
+            log_callback=self.log_callback,
+        )
+
+    def set_engine(
+        self,
+        project: DubbingProject,
+        engine: BaseTTSEngine,
+        tts_engine_id: str,
+        voice_config: dict[str, Any],
+    ) -> None:
+        """Swap the TTS engine. Existing cues are marked stale (not deleted) so
+        they can be regenerated on demand; ready cues are not re-synthesized
+        until their inputs actually differ."""
+        self.tts_engine = engine
+        project.settings.tts_engine = tts_engine_id
+        project.settings.voice_config = dict(voice_config)
+        project.settings.voice = str(voice_config.get("voice") or voice_config.get("speaker") or "")
+        invalidate_for_text_change(project.stale)
+        self.store.save_project(project)
 
     # ------------------------------------------------------------------ edit
 
@@ -618,20 +871,30 @@ class VideoDubbingService:
         self.store.save_project(project)
 
     def can_export(self, project: DubbingProject) -> tuple[bool, list[str]]:
+        from .models import BLOCKING_STATUSES
+
         blockers: list[str] = []
-        if project.settings.sync_mode == SyncMode.STRICT:
-            for cue in project.cues:
-                if not cue.enabled:
-                    continue
-                if cue.status == CueStatus.NEEDS_SHORTENING.value:
-                    blockers.append(
-                        f"Cue #{cue.sequence} needs text shortening "
-                        f"(overflow {cue.overflow_ms} ms)."
-                    )
-                if cue.status == CueStatus.FAILED.value:
-                    blockers.append(f"Cue #{cue.sequence} failed: {cue.error_message}")
+        for cue in project.cues:
+            if not cue.enabled:
+                continue
+            if cue.status in BLOCKING_STATUSES:
+                blockers.append(
+                    f"Cue #{cue.sequence}: {cue.status}"
+                    + (f" ({cue.error_message})" if cue.error_message else "")
+                )
+            elif not self._cue_has_playable_audio(cue):
+                blockers.append(f"Cue #{cue.sequence}: fitted audio missing/unreadable.")
         if project.video_path is None:
             blockers.append("No source video attached.")
         if project.dubbed_mix_wav is None:
             blockers.append("Dubbed mix not rendered.")
         return (len(blockers) == 0, blockers)
+
+    @staticmethod
+    def _cue_has_playable_audio(cue: DubbingCue) -> bool:
+        return (
+            cue.fitted_audio_path is not None
+            and Path(cue.fitted_audio_path).is_file()
+            and cue.fitted_duration_ms is not None
+            and cue.fitted_duration_ms > 0
+        )

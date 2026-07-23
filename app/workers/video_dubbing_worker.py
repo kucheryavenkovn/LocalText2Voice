@@ -15,10 +15,12 @@ class VideoDubbingWorker(QObject):
     """Runs a VideoDubbingService operation on a background thread.
 
     The operation is any callable taking the service and returning a value.
-    Progress/log/cancel are wired through Qt signals so the UI stays responsive.
+    Progress, per-cue updates, logs and cancel are wired through Qt signals so
+    the UI stays responsive and is never touched from the worker thread.
     """
 
     progress = Signal(str, int, int, str)
+    cue_updated = Signal(int, str, int, int, int)  # sequence, status, raw, fitted, index
     log = Signal(str)
     finished = Signal(object)
     failed = Signal(str)
@@ -33,8 +35,10 @@ class VideoDubbingWorker(QObject):
         self.service = service
         self.operation = operation
         self._cancel_requested = False
+        # Wire the service callbacks to Qt signals (thread-safe queued connections).
         self.service.progress_callback = self.progress.emit
         self.service.log_callback = self.log.emit
+        self.service.cue_updated_callback = self.cue_updated.emit
 
     @Slot()
     def run(self) -> None:

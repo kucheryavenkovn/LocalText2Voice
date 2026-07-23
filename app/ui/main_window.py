@@ -893,6 +893,7 @@ class MainWindow(QMainWindow):
         self.video_dubbing_page = VideoDubbingPage(
             self.tr,
             ffmpeg_path=str(self.settings.get("ffmpeg_path", "ffmpeg/ffmpeg.exe")),
+            piper_path=str(self.settings.get("piper_path", "engines/piper/piper.exe")),
             default_output_dir=str(
                 resolve_app_path(self.settings.get("output_dir", "output"))
             ),
