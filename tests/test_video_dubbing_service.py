@@ -24,6 +24,8 @@ pytestmark = pytest.mark.skipif(
 
 
 class FakeToneTTS(BaseTTSEngine):
+    engine_id = "fake"
+
     def __init__(self, ffmpeg_exe: str, durations: dict[int, float]) -> None:
         self.ffmpeg_exe = ffmpeg_exe
         self.durations = durations

@@ -48,16 +48,13 @@ def configure_logging(
     else:
         crash_handle = None
 
-    # faulthandler: dump native crashes (SIGSEGV/SIGFPE/SIGABRT) and timeouts.
+    # faulthandler: dump native crashes (SIGSEGV/SIGFPE/SIGABRT). The previous
+    # unconditional ``dump_traceback_later(30)`` is intentionally removed: it
+    # produced a spurious stack dump every 30 s even during normal long
+    # operations. Stall detection is now opt-in via
+    # app.observability.OperationWatchdog (armed only for active operations).
     try:
         faulthandler.enable(file=crash_handle if crash_handle else sys.__stderr__)
-        # Windows does not have all POSIX signals, but enable() still catches
-        # the common fatal faults. Also watchdog very long stalls.
-        if hasattr(faulthandler, "dump_traceback_later"):
-            faulthandler.dump_traceback_later(
-                timeout=30, exit=False,
-                file=crash_handle if crash_handle else sys.__stderr__,
-            )
         for signame in ("SIGABRT", "SIGFPE", "SIGILL", "SIGSEGV", "SIGBUS"):
             signum = getattr(faulthandler, signame, None) or getattr(
                 __import__("signal"), signame, None

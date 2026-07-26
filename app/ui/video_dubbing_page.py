@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable
 
@@ -109,6 +110,16 @@ class VideoDubbingPage(QWidget):
         super().__init__(parent)
         self.tr = tr
         self._tts_engine = tts_engine
+        # Ownership model for the live TTS engine instance.
+        #   "page"        — created by this page via voice_catalog; page is
+        #                   responsible for closing it on replacement/shutdown.
+        #   "main_window" — injected by MainWindow; page must NOT close it.
+        #   "host"        — originated from the shared EngineHost; never closed here.
+        #   "none"        — no engine bound yet.
+        # See _sync_tts_engine() / set_engine_context().
+        self._engine_ownership: str = "main_window" if tts_engine is not None else "none"
+        self._closed_engine_ids: set[int] = set()
+        self._log = logging.getLogger("video_dubbing.page")
         self._ffmpeg_path = ffmpeg_path
         self._piper_path = piper_path
         self._default_output_dir = default_output_dir
@@ -741,9 +752,7 @@ class VideoDubbingPage(QWidget):
         choosing Russian Woman here had no lasting effect.
         """
         if engine is not None:
-            self._tts_engine = engine
-            if self._service is not None:
-                self._service.tts_engine = engine
+            self._adopt_engine(engine, ownership="main_window")
         if ffmpeg_path:
             self._ffmpeg_path = ffmpeg_path
 
@@ -813,16 +822,113 @@ class VideoDubbingPage(QWidget):
             except Exception:
                 pass
 
+    def _adopt_engine(self, engine: BaseTTSEngine, *, ownership: str) -> None:
+        """Bind ``engine`` as the live engine, recording ownership.
+
+        ``ownership`` is one of ``"page"`` (created here, page owns its
+        lifecycle), ``"main_window"`` (injected, do not close) or ``"host"``
+        (shared EngineHost, never close). Ownership decides whether the
+        *previous* engine is closed on replacement.
+        """
+        previous = self._tts_engine
+        prev_ownership = self._engine_ownership
+        if previous is not None and previous is not engine:
+            self._maybe_close_previous_engine(previous, prev_ownership, reason="replace")
+        self._tts_engine = engine
+        self._engine_ownership = ownership
+        if self._service is not None:
+            self._service.tts_engine = engine
+        self._log.info(
+            "engine.adopt class=%s engine_id=%s ownership=%s",
+            type(engine).__name__,
+            getattr(engine, "engine_id", "") or type(engine).__name__,
+            ownership,
+        )
+
+    def _maybe_close_previous_engine(
+        self,
+        engine: BaseTTSEngine,
+        ownership: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Close ``engine`` iff the page actually owns it and no op is active.
+
+        Closing a shared/main-window/host engine here would tear down a model
+        still used by other pages, so we only close page-owned engines and only
+        when the worker thread is idle. The close is idempotent (tracked via
+        ``_closed_engine_ids``) and diagnosed (resource snapshot + result).
+        """
+        engine_obj_id = id(engine)
+        if engine_obj_id in self._closed_engine_ids:
+            return
+        if ownership != "page":
+            self._log.info(
+                "engine.close.skipped class=%s reason=not_page_owned ownership=%s "
+                "close_reason=%s",
+                type(engine).__name__,
+                ownership,
+                reason,
+            )
+            return
+        if self._worker_thread is not None and self._worker_thread.isRunning():
+            self._log.warning(
+                "engine.close.skipped class=%s reason=active_operation close_reason=%s",
+                type(engine).__name__,
+                reason,
+            )
+            return
+        engine_id = getattr(engine, "engine_id", "") or type(engine).__name__
+        before = self._engine_resource_snapshot(label=f"before_close_{engine_id}")
+        self._log.info(
+            "engine.close.start class=%s engine_id=%s reason=%s",
+            type(engine).__name__,
+            engine_id,
+            reason,
+        )
+        try:
+            engine.close()
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log.warning("engine.close.error class=%s error=%s", type(engine).__name__, exc)
+        else:
+            self._closed_engine_ids.add(engine_obj_id)
+        after = self._engine_resource_snapshot(label=f"after_close_{engine_id}")
+        self._log.info(
+            "engine.close.done class=%s engine_id=%s pid=%s rss_before_mb=%s rss_after_mb=%s",
+            type(engine).__name__,
+            engine_id,
+            _child_worker_pid(engine),
+            before.get("rss_mb"),
+            after.get("rss_mb"),
+        )
+
+    @staticmethod
+    def _engine_resource_snapshot(*, label: str) -> dict[str, Any]:
+        try:
+            from app.observability import snapshot_resources
+
+            return snapshot_resources(label=label).to_dict()
+        except Exception:  # pragma: no cover - diagnostics must never crash
+            return {}
+
     def _sync_tts_engine(self) -> BaseTTSEngine:
-        """Create/attach the engine that matches the page combo (not a stale Piper)."""
+        """Create/attach the engine that matches the page combo (not a stale Piper).
+
+        Ownership rules:
+        * an engine injected via :meth:`set_engine_context` (main window / host)
+          is reused as-is and never closed here;
+        * an engine created by this page through the voice catalog is page-owned
+          and the previous page-owned engine is closed exactly once on replace.
+        """
         engine_id = str(self.tts_engine_combo.currentData() or "piper")
+        current = self._tts_engine
         current_id = ""
-        if self._tts_engine is not None:
+        if current is not None:
             current_id = str(
-                getattr(self._tts_engine, "engine_id", "")
-                or type(self._tts_engine).__name__
+                getattr(current, "engine_id", "")
+                or type(current).__name__
             ).casefold()
-        need_new = self._tts_engine is None
+        need_new = current is None
         if not need_new:
             # Map class names → ids when engine_id attr is absent.
             class_map = {
@@ -837,16 +943,17 @@ class VideoDubbingPage(QWidget):
                 need_new = True
         if need_new:
             try:
-                self._tts_engine = self.voice_catalog.create_engine(
+                new_engine = self.voice_catalog.create_engine(
                     engine_id, self._piper_path
-                )
-                self.log_view.append_event(
-                    f"TTS engine ready: {engine_id} ({type(self._tts_engine).__name__})"
                 )
             except Exception as exc:
                 raise VideoDubbingServiceError(
                     f"Could not create TTS engine '{engine_id}': {exc}"
                 ) from exc
+            self._adopt_engine(new_engine, ownership="page")
+            self.log_view.append_event(
+                f"TTS engine ready: {engine_id} ({type(new_engine).__name__})"
+            )
         if self._service is not None:
             self._service.tts_engine = self._tts_engine
         return self._tts_engine  # type: ignore[return-value]
@@ -1154,16 +1261,19 @@ class VideoDubbingPage(QWidget):
         if self._project is None or self._loading_ui:
             return
         try:
-            # During generation do not overwrite the immutable GenerationContext
-            # snapshot with live UI voice/engine edits.
-            if not self._generation_busy:
-                self._apply_ui_to_project()
-            else:
-                # Persist only playback/selection metadata.
-                self._project.selected_sequence = self._selected_sequence
-                self._project.last_player_position_ms = int(self.media_player.position())
             service = self._ensure_service()
-            service.save_project(self._project)
+            # During active generation the worker owns the cue rows (per-cue
+            # upsert_cue). A full save_project() would DELETE+reinsert the cue
+            # table from this UI snapshot and could roll back a cue the worker
+            # just finished. Persist metadata only while busy.
+            if self._generation_busy or service.is_generation_active:
+                self._project.selected_sequence = self._selected_sequence
+                if hasattr(self, "media_player") and self.media_player is not None:
+                    self._project.last_player_position_ms = int(self.media_player.position())
+                service.save_project_metadata(self._project)
+            else:
+                self._apply_ui_to_project()
+                service.save_project(self._project)
         except VideoDubbingServiceError as exc:
             self.log_view.append_event(f"Autosave skipped: {exc}")
 
@@ -2386,9 +2496,73 @@ class VideoDubbingPage(QWidget):
         QMessageBox.information(self, "Video dubbing", message)
 
     def cleanup(self) -> None:
+        """Best-effort teardown (kept for backward compatibility).
+
+        Prefer :meth:`shutdown` from ``MainWindow.closeEvent`` — it actually
+        waits for the worker thread instead of merely requesting cancel.
+        """
         self._cancel()
         if self.media_player is not None:
             self.media_player.stop()
+
+    def shutdown(self, timeout_ms: int = 10_000) -> bool:
+        """Stop the active worker thread and wait for it to finish.
+
+        Sends cancellation to the worker + service, then blocks (on the UI
+        thread) until the QThread reports it has finished. Returns ``True`` if
+        the thread stopped within ``timeout_ms`` and ``False`` if it is still
+        running — in which case the caller must keep the window open.
+
+        ``QThread.terminate()`` is deliberately never used: killing a Python
+        thread mid-synthesis can leave FFmpeg subprocesses, CUDA contexts and
+        ``.part`` artefacts in an inconsistent state.
+        """
+        thread = self._worker_thread
+        worker = self._worker
+        # 1. Request cancellation through every channel so a worker stuck in
+        #    TTS / FFmpeg / SQLite sees the flag.
+        try:
+            if worker is not None:
+                worker.request_cancel()
+            elif self._service is not None:
+                self._service.cancel()
+        except Exception as exc:  # pragma: no cover - defensive
+            # cancel() must never be swallowed silently (crash-reporter requirement).
+            self._log.exception("shutdown.cancel.failed: %s", exc)
+        if self.media_player is not None:
+            try:
+                self.media_player.stop()
+            except Exception:  # pragma: no cover
+                pass
+        if thread is None:
+            return True
+        if not thread.isRunning():
+            # Stale handle: clear without waiting.
+            self._clear_worker()
+            return True
+        self._log.info(
+            "shutdown.wait thread=%s timeout_ms=%d operation=%s",
+            thread.objectName() or type(thread).__name__,
+            timeout_ms,
+            self._service.current_operation if self._service else "",
+        )
+        # Request the thread's event loop to exit. The worker's cancelled/
+        # finished signals are queued connections whose target affinity is the
+        # UI thread — while we block here in thread.wait() those queued
+        # invocations cannot be delivered, so we must quit() explicitly.
+        thread.quit()
+        stopped = thread.wait(timeout_ms)
+        if not stopped:
+            self._log.warning(
+                "shutdown.timeout thread still running after %d ms", timeout_ms
+            )
+            return False
+        # The thread's finished() signal clears _worker_thread/_worker, but the
+        # signal may not have been delivered yet on this UI thread. Clear the
+        # handles explicitly so the next operation can start immediately.
+        self._clear_worker()
+        self._log.info("shutdown.done thread stopped cleanly")
+        return True
 
 
 _STATUS_UI_COLORS = {
@@ -2403,6 +2577,18 @@ _STATUS_UI_COLORS = {
     CueStatus.PENDING.value: QColor("#94a3b8"),
     CueStatus.RENDERING.value: QColor("#0891b2"),
 }
+
+
+def _child_worker_pid(engine: BaseTTSEngine | None) -> int | None:
+    """Best-effort PID of a subprocess-based engine (None if in-process)."""
+    if engine is None:
+        return None
+    for attr in ("_process", "process", "_worker_process"):
+        proc = getattr(engine, attr, None)
+        pid = getattr(proc, "pid", None)
+        if isinstance(pid, int):
+            return pid
+    return None
 
 
 def _format_ms(total_ms: int) -> str:

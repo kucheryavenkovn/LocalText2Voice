@@ -41,6 +41,8 @@ pytestmark = pytest.mark.skipif(not FFMPEG_EXE, reason="ffmpeg required")
 
 
 class ScriptedTTS(BaseTTSEngine):
+    engine_id = "fake"
+
     def __init__(
         self,
         ffmpeg_exe: str,

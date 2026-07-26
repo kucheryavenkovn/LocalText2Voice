@@ -28,6 +28,8 @@ from app.tts.base import BaseTTSEngine  # noqa: E402
 
 
 class _NoopTTS(BaseTTSEngine):
+    engine_id = "fake"
+
     def cancel_current(self) -> None:
         return None
 

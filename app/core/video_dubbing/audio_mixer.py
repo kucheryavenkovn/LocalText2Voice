@@ -150,6 +150,8 @@ class AudioMixer:
         self,
         video_path: Path,
         output_path: Path,
+        *,
+        duration_seconds: float | None = None,
     ) -> Path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         arguments = [
@@ -173,7 +175,40 @@ class AudioMixer:
         except FFmpegCancelled as exc:
             raise AudioMixerCancelled(str(exc)) from exc
         except FFmpegError as exc:
+            # A video with NO audio track is legitimate (e.g. silent source
+            # footage). Synthesize a silent track so the rest of the mix
+            # pipeline (which expects an [0:a] input) keeps working instead of
+            # failing with "Output file does not contain any stream".
+            if duration_seconds and duration_seconds > 0:
+                return self._synthesize_silence(output_path, duration_seconds)
             raise AudioMixerError(f"Could not extract original audio: {exc}") from exc
+        return output_path
+
+    def _synthesize_silence(self, output_path: Path, duration_seconds: float) -> Path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        arguments = [
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"anullsrc=channel_layout=stereo:sample_rate={self.sample_rate}",
+            "-t",
+            f"{duration_seconds:.3f}",
+            "-ac",
+            str(self.channels),
+            "-ar",
+            str(self.sample_rate),
+            "-codec:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+        try:
+            self._runner_instance().run(arguments)
+        except FFmpegError as exc:
+            raise AudioMixerError(f"Could not synthesize silence: {exc}") from exc
         return output_path
 
     def encode_narration_mp3(
@@ -223,7 +258,11 @@ class AudioMixer:
 
         self.progress_callback(0, 3, "Extracting original audio...")
         original_wav = work_dir / "original_audio.wav"
-        self.extract_original_audio(Path(project.video_path), original_wav)
+        self.extract_original_audio(
+            Path(project.video_path),
+            original_wav,
+            duration_seconds=duration_ms / 1000.0 if duration_ms else None,
+        )
         self._check_cancelled()
 
         self.progress_callback(1, 3, "Building ducking envelope...")

@@ -14500,6 +14500,39 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        # Video dubbing runs on its own QThread. Block the close until that
+        # thread has actually stopped so we never hit
+        # "QThread: Destroyed while thread is still running".
+        if self.video_dubbing_page is not None:
+            thread = getattr(self.video_dubbing_page, "_worker_thread", None)
+            if thread is not None and thread.isRunning():
+                choice = QMessageBox.question(
+                    self,
+                    self.tr("video_dubbing_running_title", "Video dubbing is running"),
+                    self.tr(
+                        "video_dubbing_running_close_msg",
+                        "A dubbing operation is still running. Cancel it and "
+                        "close the application?",
+                    ),
+                )
+                if choice != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+                if not self.video_dubbing_page.shutdown(10_000):
+                    QMessageBox.warning(
+                        self,
+                        self.tr("still_stopping", "Still stopping"),
+                        self.tr(
+                            "video_dubbing_still_stopping_msg",
+                            "The dubbing worker is still stopping. Please wait a "
+                            "moment and close the application again.",
+                        ),
+                    )
+                    event.ignore()
+                    return
+            else:
+                # Ensure media + best-effort cancel even when not running.
+                self.video_dubbing_page.cleanup()
         if not self._confirm_project_switch():
             event.ignore()
             return

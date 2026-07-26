@@ -68,12 +68,14 @@ class VideoMuxer:
         ffmpeg_path: str | Path,
         progress_callback: ProgressCallback | None = None,
         log_callback: LogCallback | None = None,
+        stderr_dump_dir: Path | str | None = None,
     ) -> None:
         self.ffmpeg_path = ffmpeg_path
         self.progress_callback = progress_callback or (lambda c, t, msg: None)
         self.log_callback = log_callback or (lambda msg: None)
         self._cancel_requested = threading.Event()
         self._runner: FFmpegRunner | None = None
+        self.stderr_dump_dir = stderr_dump_dir
 
     def cancel(self) -> None:
         self._cancel_requested.set()
@@ -87,7 +89,9 @@ class VideoMuxer:
 
     def _runner_instance(self) -> FFmpegRunner:
         if self._runner is None:
-            self._runner = FFmpegRunner(find_ffmpeg(self.ffmpeg_path))
+            self._runner = FFmpegRunner(
+                find_ffmpeg(self.ffmpeg_path), stderr_dump_dir=self.stderr_dump_dir
+            )
         return self._runner
 
     def can_copy_video(
@@ -137,6 +141,14 @@ class VideoMuxer:
 
         self._check_cancelled()
         self.progress_callback(0, 2, "Muxing video and audio tracks...")
+        has_source_audio, audio_probe_error = self._source_has_audio(video_path)
+        if audio_probe_error and not has_source_audio:
+            # ffprobe failed: do NOT silently assume the video has audio and
+            # copy a non-existent stream. Surface a clear diagnostic instead.
+            raise VideoMuxError(
+                f"Could not probe source audio for {video_path.name}: "
+                f"{audio_probe_error}. The video track will not be copied blindly."
+            )
         arguments = self._build_arguments(
             project=project,
             video_path=video_path,
@@ -145,16 +157,22 @@ class VideoMuxer:
             copy_video=copy_video,
             narration_only_wav=narration_only_wav,
             srt_path=srt_path,
+            has_source_audio=has_source_audio,
         )
         try:
-            self._runner_instance().run(arguments)
+            self._runner_instance().run(arguments, label="video_mux")
         except FFmpegCancelled as exc:
             raise VideoMuxCancelled(str(exc)) from exc
         except FFmpegError as exc:
-            raise VideoMuxError(f"Could not mux final video: {exc}") from exc
+            runner = self._runner
+            full_stderr = getattr(runner, "last_full_stderr", "") if runner else ""
+            raise VideoMuxError(
+                f"Could not mux final video: {exc}"
+                + (f"\n[full stderr retained: {len(full_stderr)} chars]" if full_stderr else "")
+            ) from exc
 
         self.progress_callback(2, 2, "Final video assembled.")
-        tracks = self._expected_tracks(project, narration_only_wav, srt_path)
+        tracks = self._expected_tracks(project, narration_only_wav, srt_path, has_source_audio)
         self.log_callback(
             f"Final video: {output_path} ({container.value}, "
             f"{'copy' if copy_video else 'reencode'} video, {len(tracks)} tracks)."
@@ -166,8 +184,11 @@ class VideoMuxer:
         project: DubbingProject,
         narration_only_wav: Path | None,
         srt_path: Path | None,
+        has_source_audio: bool = True,
     ) -> list[str]:
-        tracks = ["Original", "Dubbed Mix"]
+        tracks = ["Dubbed Mix"]
+        if has_source_audio:
+            tracks = ["Original", "Dubbed Mix"]
         if (
             project.settings.export.include_narration_only
             and narration_only_wav is not None
@@ -186,6 +207,7 @@ class VideoMuxer:
         copy_video: bool,
         narration_only_wav: Path | None,
         srt_path: Path | None,
+        has_source_audio: bool = True,
     ) -> list[str]:
         settings = project.settings.export
         dubbed_mix = Path(project.dubbed_mix_wav)
@@ -226,11 +248,18 @@ class VideoMuxer:
             )
             arguments.extend(["-map", "0:v", "-c:v", video_codec])
 
-        # Audio track 0: Original (first audio stream from the source).
-        arguments.extend(["-map", "0:a:0"])
-        # Audio track 1: Dubbed Mix (default).
-        arguments.extend(["-map", "1:a:0"])
-        track_index = 2
+        # Audio track 0: Original (first audio stream of the source) — ONLY when
+        # the source actually has an audio stream. Mapping 0:a:0 on a video with
+        # no audio makes FFmpeg fail with "Could not find tag ... in stream".
+        track_index = 1
+        if has_source_audio:
+            arguments.extend(["-map", "0:a:0"])
+            # Audio track 1: Dubbed Mix (default).
+            arguments.extend(["-map", "1:a:0"])
+        else:
+            # Source has no audio: export Dubbed Mix as the only/primary track.
+            arguments.extend(["-map", "1:a:0"])
+            track_index = 0
         if narration_input_index is not None:
             arguments.extend(["-map", f"{narration_input_index}:a:0"])
             track_index += 1
@@ -248,17 +277,25 @@ class VideoMuxer:
                 arguments.extend(["-map", f"{srt_input_index}:s", "-c:s", "srt"])
 
         language = project.settings.language or "und"
-        # Track metadata + default flags. MP4 stores the readable track name
-        # in handler_name; MKV uses title. Set both so either container keeps
-        # a human-readable label.
-        arguments.extend(["-metadata:s:a:0", "title=Original"])
-        arguments.extend(["-metadata:s:a:0", "handler_name=Original"])
-        arguments.extend(["-metadata:s:a:1", "title=Dubbed Mix"])
-        arguments.extend(["-metadata:s:a:1", "handler_name=Dubbed Mix"])
-        arguments.extend(["-metadata:s:a:1", f"language={language}"])
-        # Mark Dubbed Mix (a:1) as default; original (a:0) not default.
-        arguments.extend(["-disposition:a:0", "0", "-disposition:a:1", "default"])
-        narration_meta_index = 2
+        if has_source_audio:
+            # Track metadata + default flags. MP4 stores the readable track name
+            # in handler_name; MKV uses title. Set both so either container keeps
+            # a human-readable label.
+            arguments.extend(["-metadata:s:a:0", "title=Original"])
+            arguments.extend(["-metadata:s:a:0", "handler_name=Original"])
+            arguments.extend(["-metadata:s:a:1", "title=Dubbed Mix"])
+            arguments.extend(["-metadata:s:a:1", "handler_name=Dubbed Mix"])
+            arguments.extend(["-metadata:s:a:1", f"language={language}"])
+            # Mark Dubbed Mix (a:1) as default; original (a:0) not default.
+            arguments.extend(["-disposition:a:0", "0", "-disposition:a:1", "default"])
+            narration_meta_index = 2
+        else:
+            # No source audio: Dubbed Mix is track 0 and the default track.
+            arguments.extend(["-metadata:s:a:0", "title=Dubbed Mix"])
+            arguments.extend(["-metadata:s:a:0", "handler_name=Dubbed Mix"])
+            arguments.extend(["-metadata:s:a:0", f"language={language}"])
+            arguments.extend(["-disposition:a:0", "default"])
+            narration_meta_index = 1
         if narration_input_index is not None:
             arguments.extend(
                 [
@@ -271,6 +308,19 @@ class VideoMuxer:
         arguments.extend(["-map_metadata", "0"])
         arguments.append(str(output_path))
         return arguments
+
+    def _source_has_audio(self, video_path: Path) -> tuple[bool, str | None]:
+        """Return ``(has_audio, probe_error)``.
+
+        ``probe_error`` is set when ffprobe itself failed so the caller can
+        refuse to mux instead of blindly assuming an audio stream exists.
+        """
+        try:
+            data = probe_media(video_path, self.ffmpeg_path)
+        except FFmpegError as exc:
+            return False, str(exc)
+        _duration, _video, audio = parse_video_probe(data)
+        return bool(audio), None
 
     @staticmethod
     def _audio_codec(container: OutputContainer, bitrate: str) -> str:

@@ -25,6 +25,8 @@ from app.tts.base import BaseTTSEngine, TTSEngineError
 class _ScriptedTTS(BaseTTSEngine):
     """Fake TTS that can fail on chosen cues to exercise checkpoints."""
 
+    engine_id = "fake"
+
     def __init__(self, ffmpeg_exe: str, fail_on: set[int] | None = None) -> None:
         self.ffmpeg_exe = ffmpeg_exe
         self.fail_on = fail_on or set()
@@ -137,8 +139,15 @@ def test_legacy_voice_change_requires_tts(tmp_path):
     svc = VideoDubbingService(_ScriptedTTS(FFMPEG_EXE), store=fresh)
     svc.backfill_legacy_fingerprints(reloaded)
     unchanged_plan = svc.generation_plan(reloaded, force=False)
-    assert 1 in unchanged_plan["needs_refit_from_raw"]
+    # Unchanged legacy cue must NOT require TTS. With the SQLite round-trip
+    # fixed, fit_fingerprint now survives reload, so the cue is classified as
+    # ready_without_changes (or needs_refit_from_raw if its fit drifted) —
+    # either way it is reuse, never TTS.
     assert 1 not in unchanged_plan["needs_tts_generation"]
+    assert 1 in (
+        unchanged_plan["needs_refit_from_raw"]
+        + unchanged_plan["ready_without_changes"]
+    )
 
     # Change voice -> cue 1 must require TTS (provenance unverified).
     reloaded.settings.voice = "DifferentVoice"

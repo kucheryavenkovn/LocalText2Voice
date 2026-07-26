@@ -32,6 +32,8 @@ pytestmark = pytest.mark.skipif(
 class FakeToneTTS(BaseTTSEngine):
     """Generates a deterministic tone WAV of a target duration using ffmpeg."""
 
+    engine_id = "fake"
+
     def __init__(self, ffmpeg_exe: str, duration_seconds: float) -> None:
         self.ffmpeg_exe = ffmpeg_exe
         self.duration_seconds = duration_seconds

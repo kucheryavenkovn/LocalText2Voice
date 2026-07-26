@@ -2,15 +2,29 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
+from app.observability import (
+    OperationWatchdog,
+    RunDirectory,
+    bind,
+    emit_event,
+    log_resource_snapshot,
+    new_operation_id,
+    new_session_id,
+    operation_span,
+    set_app_session_id,
+    sha256_text,
+)
+from app.observability.redaction import safe_voice_snapshot
 from app.tts.base import BaseTTSEngine
 from app.utils import ffprobe_utils
 
-from .audio_mixer import AudioMixer
-from .cue_generator import CueGenerationCancelled, CueGenerator, CueGenerationError
+from .audio_mixer import AudioMixer, AudioMixerCancelled
+from .cue_generator import CueGenerator, CueGenerationError
 from .duration_fitter import DurationFitter
 from .elastic_timing import ElasticTimingPlanner
 from .tempo_smoothing import TempoSmoothingPlanner
@@ -21,7 +35,6 @@ from .fingerprints import (
     fit_settings_fingerprint,
     legacy_combined_fingerprint,
     raw_generation_fingerprint,
-    reference_voice_identity,
 )
 from .generation import (
     CueErrorPolicy,
@@ -40,7 +53,7 @@ from .models import (
     DubbingProjectSettings,
     VideoProbeInfo,
 )
-from .preview_renderer import PreviewRenderer
+from .preview_renderer import PreviewRenderer, PreviewRenderCancelled
 from .project_store import DubbingProjectStore
 from .reports import build_report, write_reports
 from .srt_parser import (
@@ -58,8 +71,8 @@ from .stale_state import (
     invalidate_for_text_change,
     mark_clean,
 )
-from .timeline_renderer import TimelineRenderer
-from .video_muxer import VideoMuxError, VideoMuxer
+from .timeline_renderer import TimelineRenderer, TimelineRenderCancelled
+from .video_muxer import VideoMuxCancelled, VideoMuxError, VideoMuxer
 from .wav_validator import WavArtifactValidator, cleanup_part_files
 
 
@@ -73,6 +86,20 @@ _module_logger = logging.getLogger("video_dubbing")
 def _fingerprint(cue: DubbingCue, settings: DubbingProjectSettings) -> str:
     """Backward-compatible raw provenance fingerprint."""
     return legacy_combined_fingerprint(cue, settings)
+
+
+def _rel_to_project(path: Path | str | None, project: DubbingProject) -> str:
+    """Return ``path`` relative to the project dir (or its name if outside).
+
+    Used by diagnostics so events carry stable, portable paths instead of
+    absolute user paths.
+    """
+    if not path:
+        return ""
+    try:
+        return str(Path(path).relative_to(project.project_dir)).replace("\\", "/")
+    except (ValueError, TypeError):
+        return Path(path).name
 
 
 class VideoDubbingServiceError(RuntimeError):
@@ -122,6 +149,12 @@ class VideoDubbingService:
             lambda seq, status, raw, fitted, index: None
         )
         self._cancel_requested = threading.Event()
+        self._save_lock = threading.RLock()
+        # True only while the worker thread is actively writing cue rows
+        # (generate / re-fit). While True, save_project() degrades to
+        # update_project_metadata() so the UI autosave can never DELETE+reinsert
+        # the cue table and roll back a cue the worker just checkpointed.
+        self._generation_active = False
         self._active_cue_generator: CueGenerator | None = None
         self._active_timeline: TimelineRenderer | None = None
         self._active_mixer: AudioMixer | None = None
@@ -131,6 +164,12 @@ class VideoDubbingService:
         self._active_generation_context: GenerationContext | None = None
         self._wav_validator = WavArtifactValidator()
         self._generation_log: list[dict[str, Any]] = []
+        # Observability: a stable session id for the whole process, plus an
+        # optional run directory bound while a generation/heavy op is active.
+        self._app_session_id = new_session_id()
+        set_app_session_id(self._app_session_id)
+        self._active_run_dir: RunDirectory | None = None
+        self._watchdog: OperationWatchdog | None = None
 
     def _log(self, message: str, level: int = logging.INFO) -> None:
         self.log_callback(message)
@@ -146,12 +185,123 @@ class VideoDubbingService:
         detail = " ".join(f"{k}={v}" for k, v in context.items())
         _module_logger.info("OPERATION END: %s %s", name, detail)
 
+    # ------------------------------------------------------------------ observability
+
+    @contextmanager
+    def _diagnostic_run(
+        self,
+        project: DubbingProject | None,
+        run_id: str | None = None,
+    ) -> Iterator[RunDirectory | None]:
+        """Open a per-run diagnostic directory and bind it as the event sink.
+
+        Events emitted anywhere in the body (cue loop, FFmpeg runner, resource
+        snapshots) flow into ``<project>/logs/run_<run_id>/events.jsonl``. If
+        the project has no directory yet (early create/load), events degrade to
+        the application log only — they are never lost silently.
+        """
+        rid = run_id or new_operation_id()
+        project_id = project.project_id if project is not None else ""
+        if project is None or not Path(project.project_dir).exists():
+            with bind(app_session_id=self._app_session_id, project_id=project_id, run_id=rid):
+                yield None
+            return
+        run_dir = RunDirectory.create(project.project_dir, rid)
+        self._active_run_dir = run_dir
+        try:
+            with run_dir.bind(), bind(
+                app_session_id=self._app_session_id,
+                project_id=project_id,
+                run_id=rid,
+            ):
+                yield run_dir
+        finally:
+            try:
+                run_dir.finalize()
+            except Exception:  # pragma: no cover
+                pass
+            if self._active_run_dir is run_dir:
+                self._active_run_dir = None
+
+    def _snapshot_resources(self, project: DubbingProject | None, *, label: str) -> None:
+        """Record a resource snapshot at an operation boundary."""
+        try:
+            log_resource_snapshot(
+                project.project_dir if project is not None else None,
+                label=label,
+            )
+        except Exception:  # pragma: no cover - diagnostics must never crash
+            pass
+
+    def _tts_snapshot(
+        self,
+        context: GenerationContext,
+        *,
+        text_length: int,
+        text_sha256: str,
+    ) -> dict[str, Any]:
+        """Redacted TTS configuration snapshot emitted before each synthesis.
+
+        Never contains API keys, bearer tokens, full subtitle text or full
+        reference transcripts — only their hashes / lengths.
+        """
+        ref_path = context.reference_voice_path
+        snapshot = {
+            "engine_id": context.engine_id,
+            "engine_class": type(self.tts_engine).__name__,
+            "model_id": context.model_id,
+            "voice_id": context.voice_id,
+            "language": context.language,
+            "sample_rate": context.sample_rate,
+            "channels": context.channels,
+            "reference_voice_filename": Path(ref_path).name if ref_path else None,
+            "reference_voice_sha256": context.reference_voice_content_hash,
+            "text_length": text_length,
+            "text_sha256": text_sha256,
+            "speed": context.speed,
+            "voice_config": safe_voice_snapshot(context.voice_config),
+        }
+        emit_event("tts.snapshot", payload=snapshot, force_flush=False)
+        return snapshot
+
+    @property
+    def active_run_directory(self) -> RunDirectory | None:
+        return self._active_run_dir
+
+    def _arm_watchdog(self, label: str, *, timeout_seconds: float = 180.0) -> None:
+        """Arm a stall watchdog for an active long-running operation."""
+        self._cancel_watchdog()
+        try:
+            self._watchdog = OperationWatchdog(
+                timeout_seconds=timeout_seconds, label=label
+            )
+            self._watchdog.arm()
+        except Exception:  # pragma: no cover
+            self._watchdog = None
+
+    def _heartbeat_watchdog(self) -> None:
+        if self._watchdog is not None:
+            try:
+                self._watchdog.heartbeat()
+            except Exception:  # pragma: no cover
+                pass
+
+    def _cancel_watchdog(self) -> None:
+        if self._watchdog is not None:
+            try:
+                self._watchdog.cancel()
+            except Exception:  # pragma: no cover
+                pass
+            self._watchdog = None
+
     @property
     def current_operation(self) -> str:
         return self._current_operation
 
     def cancel(self) -> None:
         self._cancel_requested.set()
+        emit_event("operation.cancel_requested", force_flush=True)
+        self._cancel_watchdog()
         for component in (
             self._active_cue_generator,
             self._active_timeline,
@@ -162,8 +312,11 @@ class VideoDubbingService:
             if component is not None:
                 try:
                     component.cancel()
-                except Exception:  # pragma: no cover - defensive
-                    pass
+                except Exception as exc:  # pragma: no cover - defensive
+                    # cancel() failures must never be swallowed silently.
+                    _module_logger.exception(
+                        "cancel component %s failed: %s", type(component).__name__, exc
+                    )
 
     def reset_cancel(self) -> None:
         """Allow a new operation after the previous one was cancelled."""
@@ -186,9 +339,95 @@ class VideoDubbingService:
                     except Exception:
                         pass
 
+    @staticmethod
+    def _engine_class_family(engine_name: str) -> str:
+        """Map an engine class name to its canonical family id."""
+        engine_name = engine_name.casefold()
+        class_map = {
+            "piperttsengine": "piper",
+            "omnivoicettsengine": "omnivoice",
+            "chatterboxttsengine": "chatterbox",
+            "kokoropythonttsengine": "kokoro",
+            "kokorottsengine": "kokoro",
+            "qwenttsengine": "qwen",
+        }
+        if engine_name in class_map:
+            return class_map[engine_name]
+        for key, family in class_map.items():
+            if key in engine_name:
+                return family
+        return ""
+
+    _ENGINE_FAMILY_ALIASES = {
+        "piper": "piper",
+        "omnivoice": "omnivoice",
+        "chatterbox": "chatterbox",
+        "kokoro": "kokoro",
+        "kokoro_python": "kokoro",
+        "qwen": "qwen",
+    }
+
+    def _engine_mismatch_message(
+        self,
+        engine: BaseTTSEngine | None,
+        expected_engine_id: str,
+    ) -> str | None:
+        """Return an error message iff we have *positive* evidence of mismatch.
+
+        Identity resolution order:
+
+        1. ``engine.engine_id`` — authoritative when set (covers API engines and
+           in-process runtimes that declare their id). A direct equality check
+           avoids false mismatches for engines whose class name does not encode
+           the family (e.g. test doubles, ``HttpTTSEngine``).
+        2. Class-name family mapping for engines without ``engine_id``.
+
+        An engine whose family cannot be determined (unrecognised class name and
+        no ``engine_id``) is **not** treated as a mismatch: ``validate()`` is
+        the authority there, and hard-failing would make every third-party or
+        test double mass-fail with a misleading "Engine mismatch".
+        """
+        if engine is None:
+            return "No TTS engine bound to the service."
+        expected = str(expected_engine_id or "").casefold()
+        if not expected:
+            return None
+        want = self._ENGINE_FAMILY_ALIASES.get(expected, expected)
+        explicit = str(getattr(engine, "engine_id", "") or "").casefold()
+        if explicit:
+            resolved = self._ENGINE_FAMILY_ALIASES.get(explicit, explicit)
+            if resolved == want or want in resolved or resolved in want:
+                return None
+            return (
+                f"Engine mismatch: project wants '{expected_engine_id}' but the "
+                f"bound engine identifies as '{explicit}' "
+                f"({type(engine).__name__}). Re-select the TTS engine."
+            )
+        engine_name = type(engine).__name__
+        resolved = self._engine_class_family(engine_name)
+        if not resolved:
+            # Unrecognised engine: cannot prove a mismatch — let validate() decide.
+            return None
+        if resolved == want or want in resolved or resolved in want:
+            return None
+        return (
+            f"Engine mismatch: project wants '{expected_engine_id}' but service "
+            f"has {engine_name} (family '{resolved}'). Re-select the TTS engine."
+        )
+
     def _check_cancelled(self) -> None:
         if self._cancel_requested.is_set():
             raise GenerationCancelled("Operation cancelled.")
+
+    @property
+    def is_generation_active(self) -> bool:
+        """True while the worker is actively writing cue rows.
+
+        The UI uses this (and the page uses ``_generation_busy``) to route
+        autosave through metadata-only persistence so a full save cannot roll
+        back a cue the worker just checkpointed.
+        """
+        return self._generation_active
 
     @property
     def active_generation_context(self) -> GenerationContext | None:
@@ -316,7 +555,28 @@ class VideoDubbingService:
         self.store.delete_project(project_id)
 
     def save_project(self, project: DubbingProject) -> None:
-        self.store.save_project(project)
+        """Persist the project.
+
+        During active generation a full save would ``DELETE``+reinsert every
+        cue row from the (possibly stale) UI snapshot, racing the worker's
+        per-cue ``upsert_cue`` and rolling back just-finished cues. When
+        generation is active we therefore persist **metadata only** — cue rows
+        are owned by the worker thread until it finishes.
+        """
+        with self._save_lock:
+            if self._generation_active:
+                self._log(
+                    "save_project during active generation: metadata only "
+                    "(cue rows preserved by worker)."
+                )
+                self.store.update_project_metadata(project)
+                return
+            self.store.save_project(project)
+
+    def save_project_metadata(self, project: DubbingProject) -> None:
+        """Persist project metadata without touching cue rows (autosave-safe)."""
+        with self._save_lock:
+            self.store.update_project_metadata(project)
 
     # ------------------------------------------------------------------ import
 
@@ -583,56 +843,78 @@ class VideoDubbingService:
         error_policy: CueErrorPolicy | str | None = None,
     ) -> GenerationRunResult:
         context = self.build_generation_context(project)
-        plan = self.generation_plan(project, force=force, context=context)
-        if force:
-            targets = [c for c in project.cues if c.enabled]
-        else:
-            need = set(plan["needs_tts_generation"]) | set(plan["needs_refit_from_raw"])
-            targets = [c for c in project.cues if c.sequence in need]
-        self._log(
-            f"Ready: {len(plan['ready_without_changes'])} | "
-            f"Refit-from-raw: {len(plan['needs_refit_from_raw'])} | "
-            f"TTS: {len(plan['needs_tts_generation'])} | "
-            f"Legacy unverified: {len(plan['legacy_audio_unverified'])} | "
-            f"Missing raw: {len(plan['missing_raw'])} | "
-            f"Failed: {len(plan['failed'])}"
-        )
-        self._begin_operation(
-            "generate_all", cues=len(targets), total=len(project.cues), force=force
-        )
-        self._log(
-            "GenerationContext: "
-            f"engine={context.engine_id} voice={context.voice_id} "
-            f"ref={Path(context.reference_voice_path).name if context.reference_voice_path else '—'} "
-            f"ref_hash={(context.reference_voice_content_hash or '')[:12] or '—'} "
-            f"lang={context.language}"
-        )
-        try:
-            result = self._generate_many(
-                project,
-                targets,
-                force=force,
-                error_policy=error_policy,
-                context=context,
+        with self._diagnostic_run(project, run_id=context.run_id), bind(
+            engine_id=context.engine_id,
+            engine_class=type(self.tts_engine).__name__,
+            run_id=context.run_id,
+        ), operation_span(
+            "generate_all",
+            project_id=project.project_id,
+            run_id=context.run_id,
+            extra={"force": force, "engine_id": context.engine_id},
+        ):
+            plan = self.generation_plan(project, force=force, context=context)
+            emit_event(
+                "generation.plan",
+                payload={
+                    "ready": len(plan["ready_without_changes"]),
+                    "needs_refit": len(plan["needs_refit_from_raw"]),
+                    "needs_tts": len(plan["needs_tts_generation"]),
+                    "legacy_unverified": len(plan["legacy_audio_unverified"]),
+                    "missing_raw": len(plan["missing_raw"]),
+                    "failed": len(plan["failed"]),
+                    "force": force,
+                },
             )
-            # Only post-process when real cue audio was produced.
-            if (
-                result.status
-                in {
-                    GenerationRunStatus.COMPLETED,
-                    GenerationRunStatus.COMPLETED_WITH_ERRORS,
-                }
-                and result.completed_count > 0
-            ):
-                tempo_n = self.apply_tempo_smoothing(project)
-                if tempo_n:
-                    self._log(f"Tempo smoothing updated {tempo_n} cue(s).")
-                smoothed = self.auto_smooth_neighbors(project)
-                if smoothed:
-                    self._log(f"Auto-smoothed {smoothed} elastic group(s).")
-            return result
-        finally:
-            self._end_operation("generate_all", cues=len(targets))
+            if force:
+                targets = [c for c in project.cues if c.enabled]
+            else:
+                need = set(plan["needs_tts_generation"]) | set(plan["needs_refit_from_raw"])
+                targets = [c for c in project.cues if c.sequence in need]
+            self._log(
+                f"Ready: {len(plan['ready_without_changes'])} | "
+                f"Refit-from-raw: {len(plan['needs_refit_from_raw'])} | "
+                f"TTS: {len(plan['needs_tts_generation'])} | "
+                f"Legacy unverified: {len(plan['legacy_audio_unverified'])} | "
+                f"Missing raw: {len(plan['missing_raw'])} | "
+                f"Failed: {len(plan['failed'])}"
+            )
+            self._begin_operation(
+                "generate_all", cues=len(targets), total=len(project.cues), force=force
+            )
+            self._log(
+                "GenerationContext: "
+                f"engine={context.engine_id} voice={context.voice_id} "
+                f"ref={Path(context.reference_voice_path).name if context.reference_voice_path else '—'} "
+                f"ref_hash={(context.reference_voice_content_hash or '')[:12] or '—'} "
+                f"lang={context.language}"
+            )
+            try:
+                result = self._generate_many(
+                    project,
+                    targets,
+                    force=force,
+                    error_policy=error_policy,
+                    context=context,
+                )
+                # Only post-process when real cue audio was produced.
+                if (
+                    result.status
+                    in {
+                        GenerationRunStatus.COMPLETED,
+                        GenerationRunStatus.COMPLETED_WITH_ERRORS,
+                    }
+                    and result.completed_count > 0
+                ):
+                    tempo_n = self.apply_tempo_smoothing(project)
+                    if tempo_n:
+                        self._log(f"Tempo smoothing updated {tempo_n} cue(s).")
+                    smoothed = self.auto_smooth_neighbors(project)
+                    if smoothed:
+                        self._log(f"Auto-smoothed {smoothed} elastic group(s).")
+                return result
+            finally:
+                self._end_operation("generate_all", cues=len(targets))
 
     def re_fit_existing(self, project: DubbingProject) -> GenerationRunResult:
         """Re-fit existing raw WAV under the current speed policy WITHOUT TTS."""
@@ -654,6 +936,7 @@ class VideoDubbingService:
         last_id: str | None = None
         status = GenerationRunStatus.COMPLETED
         error_message: str | None = None
+        self._generation_active = True
         try:
             for index, cue in enumerate(targets, start=1):
                 self._check_cancelled()
@@ -692,6 +975,7 @@ class VideoDubbingService:
         finally:
             self._active_cue_generator = None
             self._active_generation_context = None
+            self._generation_active = False
             self._end_operation("re_fit", cues=len(targets))
         invalidate_for_narration_change(project.stale)
         msg = {
@@ -752,29 +1036,17 @@ class VideoDubbingService:
 
         context = context or self.build_generation_context(project)
         policy = self._resolve_error_policy(project, error_policy)
-        # Force always stops on first hard failure so silent mass-fail is visible.
-        if force and error_policy is None:
+        # Force stops on first hard failure so silent mass-fail is visible —
+        # but an explicit CONTINUE policy (set by the user/project) is honoured
+        # even under force, so a single bad cue does not abort a forced run.
+        if force and error_policy is None and policy != CueErrorPolicy.CONTINUE:
             policy = CueErrorPolicy.STOP
         self.reset_cancel()
         self._active_generation_context = context
         # Fail fast if the live engine object does not match the project engine.
-        engine_name = type(self.tts_engine).__name__.casefold()
-        expected = str(context.engine_id or "").casefold()
-        engine_ok = {
-            "piper": "piper",
-            "omnivoice": "omnivoice",
-            "chatterbox": "chatterbox",
-            "kokoro": "kokoro",
-            "kokoro_python": "kokoro",
-            "qwen": "qwen",
-        }
-        want = engine_ok.get(expected, expected)
-        if want and want not in engine_name:
-            msg = (
-                f"Engine mismatch: project wants '{context.engine_id}' but service "
-                f"has {type(self.tts_engine).__name__}. Re-select the TTS engine."
-            )
-            self._log(msg, level=logging.ERROR)
+        mismatch_msg = self._engine_mismatch_message(self.tts_engine, context.engine_id)
+        if mismatch_msg is not None:
+            self._log(mismatch_msg, level=logging.ERROR)
             return GenerationRunResult(
                 status=GenerationRunStatus.FAILED,
                 total_count=len(cues),
@@ -782,7 +1054,7 @@ class VideoDubbingService:
                 failed_count=0,
                 cancelled_count=0,
                 skipped_count=len(cues),
-                error_message=msg,
+                error_message=mismatch_msg,
                 run_id=context.run_id,
             )
         # Validate speaker reference once up front (fail fast, not 149 silent errors).
@@ -838,143 +1110,197 @@ class VideoDubbingService:
         error_message: str | None = None
         stopped_on_error = False
         batch_started = _time.perf_counter()
+        self._generation_active = True
+        self._snapshot_resources(project, label="before_generation")
+        self._arm_watchdog("generate", timeout_seconds=300.0)
         try:
             for index, cue in enumerate(cues, start=1):
                 self._check_cancelled()
-                self.progress_callback("tts", index - 1, total, f"Cue #{cue.sequence}")
-                self.cue_updated_callback(
-                    cue.sequence, CueStatus.RENDERING.value, 0, 0, index
-                )
-                started_at = __import__("datetime").datetime.now(
-                    __import__("datetime").timezone.utc
-                ).isoformat()
-                cue_t0 = _time.perf_counter()
-                try:
-                    self._synthesize_and_fit(
-                        generator,
-                        project,
-                        cue,
-                        context,
-                        force=force,
-                        fitter=fitter,
-                        cues_sorted=cues_sorted,
-                    )
-                    elapsed_ms = int((_time.perf_counter() - cue_t0) * 1000)
-                    self.store.upsert_cue(project.project_id, cue)
+                self._heartbeat_watchdog()
+                with bind(cue_id=cue.cue_id, cue_sequence=cue.sequence, attempt=index):
+                    self.progress_callback("tts", index - 1, total, f"Cue #{cue.sequence}")
                     self.cue_updated_callback(
-                        cue.sequence,
-                        cue.status,
-                        cue.raw_duration_ms or 0,
-                        cue.fitted_duration_ms or 0,
-                        index,
+                        cue.sequence, CueStatus.RENDERING.value, 0, 0, index
                     )
-                    completed += 1
-                    last_id = cue.cue_id
-                    self._log(
-                        f"OK cue #{cue.sequence} in {elapsed_ms} ms "
-                        f"raw={cue.raw_duration_ms}ms status={cue.status}"
+                    emit_event(
+                        "cue.started",
+                        payload={
+                            "sequence": cue.sequence,
+                            "cue_id": cue.cue_id,
+                            "text_length": len(cue.spoken_text or ""),
+                            "text_sha256": sha256_text(cue.spoken_text),
+                            "duration_budget_ms": cue.duration_budget_ms,
+                            "attempt": index,
+                        },
                     )
-                    # Real OmniVoice is never <80ms end-to-end; guard against no-op TTS.
-                    if force and elapsed_ms < 50 and (cue.raw_duration_ms or 0) > 0:
+                    started_at = __import__("datetime").datetime.now(
+                        __import__("datetime").timezone.utc
+                    ).isoformat()
+                    cue_t0 = _time.perf_counter()
+                    try:
+                        self._synthesize_and_fit(
+                            generator,
+                            project,
+                            cue,
+                            context,
+                            force=force,
+                            fitter=fitter,
+                            cues_sorted=cues_sorted,
+                        )
+                        elapsed_ms = int((_time.perf_counter() - cue_t0) * 1000)
+                        self._check_cancelled()
+                        self.store.upsert_cue(project.project_id, cue)
+                        emit_event(
+                            "cue.persisted",
+                            payload={
+                                "sequence": cue.sequence,
+                                "cue_id": cue.cue_id,
+                                "status": cue.status,
+                                "raw_duration_ms": cue.raw_duration_ms,
+                                "fitted_duration_ms": cue.fitted_duration_ms,
+                                "required_speed_factor": cue.required_speed_factor,
+                                "applied_speed_factor": cue.applied_speed_factor,
+                                "elapsed_ms": elapsed_ms,
+                                "raw_path": _rel_to_project(cue.raw_audio_path, project),
+                                "fitted_path": _rel_to_project(cue.fitted_audio_path, project),
+                            },
+                            force_flush=True,
+                        )
+                        self.cue_updated_callback(
+                            cue.sequence,
+                            cue.status,
+                            cue.raw_duration_ms or 0,
+                            cue.fitted_duration_ms or 0,
+                            index,
+                        )
+                        completed += 1
+                        last_id = cue.cue_id
                         self._log(
-                            f"WARNING cue #{cue.sequence}: suspiciously fast TTS "
-                            f"({elapsed_ms} ms) — check engine is really synthesizing.",
+                            f"OK cue #{cue.sequence} in {elapsed_ms} ms "
+                            f"raw={cue.raw_duration_ms}ms status={cue.status}"
+                        )
+                        # Real OmniVoice is never <80ms end-to-end; guard against no-op TTS.
+                        if force and elapsed_ms < 50 and (cue.raw_duration_ms or 0) > 0:
+                            self._log(
+                                f"WARNING cue #{cue.sequence}: suspiciously fast TTS "
+                                f"({elapsed_ms} ms) — check engine is really synthesizing.",
+                                level=logging.WARNING,
+                            )
+                        self._generation_log.append(
+                            {
+                                "run_id": context.run_id,
+                                "cue_id": cue.cue_id,
+                                "engine_id": context.engine_id,
+                                "voice_id": context.voice_id,
+                                "reference_voice_hash": context.reference_voice_content_hash,
+                                "raw_generation_fingerprint": cue.generation_fingerprint,
+                                "started_at": started_at,
+                                "finished_at": __import__("datetime").datetime.now(
+                                    __import__("datetime").timezone.utc
+                                ).isoformat(),
+                                "result": "completed",
+                                "elapsed_ms": elapsed_ms,
+                            }
+                        )
+                    except GenerationCancelled:
+                        cancelled_count = 1
+                        if generator is not None:
+                            generator.cleanup_partial_artifacts()
+                        if cue.status in {
+                            CueStatus.RENDERING.value,
+                            CueStatus.PENDING.value,
+                        } or cue.status == CueStatus.CANCELLED.value:
+                            cue.status = CueStatus.CANCELLED.value
+                            cue.error_message = "Cancelled."
+                        self.store.upsert_cue(project.project_id, cue)
+                        emit_event(
+                            "cue.cancelled",
+                            payload={
+                                "sequence": cue.sequence,
+                                "cue_id": cue.cue_id,
+                                "status": cue.status,
+                            },
+                            force_flush=True,
+                        )
+                        self.cue_updated_callback(
+                            cue.sequence, cue.status, 0, 0, index
+                        )
+                        last_id = cue.cue_id
+                        status = GenerationRunStatus.CANCELLED
+                        error_message = "Generation cancelled."
+                        self._log(
+                            f"CANCELLED at cue #{cue.sequence}",
                             level=logging.WARNING,
                         )
-                    self._generation_log.append(
-                        {
-                            "run_id": context.run_id,
-                            "cue_id": cue.cue_id,
-                            "engine_id": context.engine_id,
-                            "voice_id": context.voice_id,
-                            "reference_voice_hash": context.reference_voice_content_hash,
-                            "raw_generation_fingerprint": cue.generation_fingerprint,
-                            "started_at": started_at,
-                            "finished_at": __import__("datetime").datetime.now(
-                                __import__("datetime").timezone.utc
-                            ).isoformat(),
-                            "result": "completed",
-                            "elapsed_ms": elapsed_ms,
-                        }
-                    )
-                except GenerationCancelled:
-                    cancelled_count = 1
-                    if generator is not None:
-                        generator.cleanup_partial_artifacts()
-                    if cue.status in {
-                        CueStatus.RENDERING.value,
-                        CueStatus.PENDING.value,
-                    } or cue.status == CueStatus.CANCELLED.value:
-                        cue.status = CueStatus.CANCELLED.value
-                        cue.error_message = "Cancelled."
-                    self.store.upsert_cue(project.project_id, cue)
-                    self.cue_updated_callback(
-                        cue.sequence, cue.status, 0, 0, index
-                    )
-                    last_id = cue.cue_id
-                    status = GenerationRunStatus.CANCELLED
-                    error_message = "Generation cancelled."
-                    self._log(
-                        f"CANCELLED at cue #{cue.sequence}",
-                        level=logging.WARNING,
-                    )
-                    self._generation_log.append(
-                        {
-                            "run_id": context.run_id,
-                            "cue_id": cue.cue_id,
-                            "engine_id": context.engine_id,
-                            "voice_id": context.voice_id,
-                            "reference_voice_hash": context.reference_voice_content_hash,
-                            "raw_generation_fingerprint": cue.generation_fingerprint,
-                            "started_at": started_at,
-                            "finished_at": __import__("datetime").datetime.now(
-                                __import__("datetime").timezone.utc
-                            ).isoformat(),
-                            "result": "cancelled",
-                        }
-                    )
-                    break
-                except CueGenerationError as exc:
-                    elapsed_ms = int((_time.perf_counter() - cue_t0) * 1000)
-                    cue.status = CueStatus.FAILED.value
-                    cue.error_message = str(exc)
-                    failed_ids.append(cue.cue_id)
-                    self.store.upsert_cue(project.project_id, cue)
-                    self.cue_updated_callback(
-                        cue.sequence, cue.status, 0, 0, index
-                    )
-                    self.log_callback(f"Cue #{cue.sequence} failed: {exc}")
-                    self._log(
-                        f"FAIL cue #{cue.sequence} in {elapsed_ms} ms: {exc}",
-                        level=logging.ERROR,
-                    )
-                    last_id = cue.cue_id
-                    self._generation_log.append(
-                        {
-                            "run_id": context.run_id,
-                            "cue_id": cue.cue_id,
-                            "engine_id": context.engine_id,
-                            "voice_id": context.voice_id,
-                            "reference_voice_hash": context.reference_voice_content_hash,
-                            "raw_generation_fingerprint": cue.generation_fingerprint,
-                            "started_at": started_at,
-                            "finished_at": __import__("datetime").datetime.now(
-                                __import__("datetime").timezone.utc
-                            ).isoformat(),
-                            "result": "failed",
-                            "error": str(exc),
-                            "elapsed_ms": elapsed_ms,
-                        }
-                    )
-                    if policy == CueErrorPolicy.STOP:
-                        stopped_on_error = True
-                        status = GenerationRunStatus.FAILED
-                        error_message = f"Cue #{cue.sequence}: {exc}"
-                        self.log_callback(
-                            f"Generation stopped at cue #{cue.sequence} "
-                            f"({total - index} cue(s) pending)."
+                        self._generation_log.append(
+                            {
+                                "run_id": context.run_id,
+                                "cue_id": cue.cue_id,
+                                "engine_id": context.engine_id,
+                                "voice_id": context.voice_id,
+                                "reference_voice_hash": context.reference_voice_content_hash,
+                                "raw_generation_fingerprint": cue.generation_fingerprint,
+                                "started_at": started_at,
+                                "finished_at": __import__("datetime").datetime.now(
+                                    __import__("datetime").timezone.utc
+                                ).isoformat(),
+                                "result": "cancelled",
+                            }
                         )
                         break
+                    except CueGenerationError as exc:
+                        elapsed_ms = int((_time.perf_counter() - cue_t0) * 1000)
+                        cue.status = CueStatus.FAILED.value
+                        cue.error_message = str(exc)
+                        failed_ids.append(cue.cue_id)
+                        self.store.upsert_cue(project.project_id, cue)
+                        emit_event(
+                            "cue.failed",
+                            payload={
+                                "sequence": cue.sequence,
+                                "cue_id": cue.cue_id,
+                                "status": cue.status,
+                                "error": str(exc),
+                                "elapsed_ms": elapsed_ms,
+                            },
+                            force_flush=True,
+                        )
+                        self.cue_updated_callback(
+                            cue.sequence, cue.status, 0, 0, index
+                        )
+                        self.log_callback(f"Cue #{cue.sequence} failed: {exc}")
+                        self._log(
+                            f"FAIL cue #{cue.sequence} in {elapsed_ms} ms: {exc}",
+                            level=logging.ERROR,
+                        )
+                        last_id = cue.cue_id
+                        self._generation_log.append(
+                            {
+                                "run_id": context.run_id,
+                                "cue_id": cue.cue_id,
+                                "engine_id": context.engine_id,
+                                "voice_id": context.voice_id,
+                                "reference_voice_hash": context.reference_voice_content_hash,
+                                "raw_generation_fingerprint": cue.generation_fingerprint,
+                                "started_at": started_at,
+                                "finished_at": __import__("datetime").datetime.now(
+                                    __import__("datetime").timezone.utc
+                                ).isoformat(),
+                                "result": "failed",
+                                "error": str(exc),
+                                "elapsed_ms": elapsed_ms,
+                            }
+                        )
+                        if policy == CueErrorPolicy.STOP:
+                            stopped_on_error = True
+                            status = GenerationRunStatus.FAILED
+                            error_message = f"Cue #{cue.sequence}: {exc}"
+                            self.log_callback(
+                                f"Generation stopped at cue #{cue.sequence} "
+                                f"({total - index} cue(s) pending)."
+                            )
+                            break
+                    self._snapshot_resources(project, label=f"after_cue_{cue.sequence}")
         except GenerationCancelled:
             status = GenerationRunStatus.CANCELLED
             error_message = "Generation cancelled."
@@ -984,6 +1310,9 @@ class VideoDubbingService:
         finally:
             self._active_cue_generator = None
             self._active_generation_context = None
+            self._generation_active = False
+            self._cancel_watchdog()
+            self._snapshot_resources(project, label="after_generation")
             if status == GenerationRunStatus.CANCELLED:
                 done_msg = "Generation cancelled"
             elif stopped_on_error:
@@ -1040,6 +1369,17 @@ class VideoDubbingService:
         provenance_verified = bool(cue.generation_fingerprint) and (
             cue.generation_fingerprint == current_fp
         )
+        emit_event(
+            "cue.plan",
+            payload={
+                "sequence": cue.sequence,
+                "cue_id": cue.cue_id,
+                "raw_intact": raw_intact,
+                "provenance_verified": provenance_verified,
+                "legacy_audio_unverified": cue.legacy_audio_unverified,
+                "force": force,
+            },
+        )
         if force:
             needs_tts = True
         elif not raw_intact:
@@ -1056,6 +1396,13 @@ class VideoDubbingService:
             # Deleting first made force-runs that failed leave the project silent
             # and looked like "regeneration never started".
             voice_cfg = dict(context.voice_config)
+            self._tts_snapshot(
+                context,
+                text_length=len(cue.spoken_text or ""),
+                text_sha256=sha256_text(cue.spoken_text),
+            )
+            emit_event("cue.tts.started", payload={"sequence": cue.sequence})
+            tts_t0 = __import__("time").perf_counter()
             self._log(
                 f"TTS cue #{cue.sequence} force={force} "
                 f"voice={context.voice_id or '—'} "
@@ -1063,12 +1410,54 @@ class VideoDubbingService:
                 f"ref_in_cfg={bool(voice_cfg.get('reference_audio_path'))} "
                 f"engine={type(self.tts_engine).__name__}"
             )
-            generator.generate_raw(cue, voice_cfg)
+            try:
+                generator.generate_raw(cue, voice_cfg)
+            except Exception:
+                # Fatal TTS error: the engine instance is suspect and must not
+                # be silently reused for the next cue.
+                try:
+                    setattr(self.tts_engine, "_ltv_unusable", True)
+                except Exception:  # pragma: no cover
+                    pass
+                emit_event(
+                    "cue.tts.failed",
+                    payload={
+                        "sequence": cue.sequence,
+                        "elapsed_ms": int((__import__("time").perf_counter() - tts_t0) * 1000),
+                    },
+                    force_flush=True,
+                )
+                raise
+            tts_elapsed_ms = int((__import__("time").perf_counter() - tts_t0) * 1000)
             # Fingerprint comes from the immutable run snapshot, never live UI.
             cue.generation_fingerprint = current_fp
             cue.legacy_audio_unverified = False
             cue.legacy_observed_fingerprint = ""
             cue.raw_wav_hash = file_content_hash(cue.raw_audio_path) or ""
+            wav_result = self._wav_validator.validate(Path(cue.raw_audio_path))
+            emit_event(
+                "cue.tts.completed",
+                payload={
+                    "sequence": cue.sequence,
+                    "elapsed_ms": tts_elapsed_ms,
+                    "raw_duration_ms": cue.raw_duration_ms,
+                    "raw_wav_hash": cue.raw_wav_hash,
+                    "raw_path": _rel_to_project(cue.raw_audio_path, project),
+                    "raw_size": Path(cue.raw_audio_path).stat().st_size
+                    if cue.raw_audio_path and Path(cue.raw_audio_path).is_file()
+                    else None,
+                },
+            )
+            emit_event(
+                "cue.wav.validation",
+                payload={
+                    "sequence": cue.sequence,
+                    "valid": wav_result.valid,
+                    "duration_ms": wav_result.duration_ms,
+                    "error_code": wav_result.error_code,
+                    "error_message": wav_result.error_message,
+                },
+            )
         elif not cue.raw_wav_hash and cue.raw_audio_path:
             cue.raw_wav_hash = file_content_hash(cue.raw_audio_path) or ""
 
@@ -1078,6 +1467,16 @@ class VideoDubbingService:
             cues_sorted = sorted(project.cues, key=lambda c: c.effective_start_ms())
         next_cue = self._next_cue(cues_sorted, cue)
         result = fitter.evaluate(cue, next_cue=next_cue)
+        emit_event(
+            "cue.fit.evaluated",
+            payload={
+                "sequence": cue.sequence,
+                "strategy": str(result.strategy.value if hasattr(result.strategy, "value") else result.strategy),
+                "applied_speed_factor": result.applied_speed_factor,
+                "fitted_duration_ms": result.fitted_duration_ms,
+                "blocking": result.blocking,
+            },
+        )
         fitter.apply_result(cue, result)
         generator.apply_fitting(
             cue,
@@ -1092,6 +1491,15 @@ class VideoDubbingService:
             settings=project.settings,
         )
         cue.fit_pipeline_version = 1
+        emit_event(
+            "cue.fit.completed",
+            payload={
+                "sequence": cue.sequence,
+                "applied_speed_factor": cue.applied_speed_factor,
+                "fitted_duration_ms": cue.fitted_duration_ms,
+                "fitted_path": _rel_to_project(cue.fitted_audio_path, project),
+            },
+        )
         if cue.legacy_audio_unverified and not needs_tts:
             # Successful legacy refit: keep legacy raw flag but record fit so
             # reopening does not loop forever.
@@ -1504,151 +1912,224 @@ class VideoDubbingService:
         project: DubbingProject,
         output_path: Path | None = None,
     ) -> Path:
-        self._begin_operation("render_narration", duration_ms=project.duration_ms)
-        if output_path is None:
-            output_path = project.render_dir() / "narration.wav"
-        renderer = TimelineRenderer(
-            ffmpeg_path=project.settings.ffmpeg_path,
-            sample_rate=project.settings.sample_rate,
-            channels=project.settings.channels,
-            progress_callback=lambda c, t, msg: self.progress_callback(
-                "narration", c, t, msg
-            ),
-            log_callback=self.log_callback,
-        )
-        self._active_timeline = renderer
-        try:
-            renderer.render(
-                project,
-                output_path,
-                alignment=project.settings.preview.alignment,
+        with self._diagnostic_run(project) as run_dir, operation_span(
+            "render_narration",
+            project_id=project.project_id,
+            run_id=getattr(run_dir, "run_id", None),
+            extra={"duration_ms": project.duration_ms},
+        ):
+            self._begin_operation("render_narration", duration_ms=project.duration_ms)
+            self._snapshot_resources(project, label="before_narration")
+            if output_path is None:
+                output_path = project.render_dir() / "narration.wav"
+            renderer = TimelineRenderer(
+                ffmpeg_path=project.settings.ffmpeg_path,
+                sample_rate=project.settings.sample_rate,
+                channels=project.settings.channels,
+                progress_callback=lambda c, t, msg: (
+                    self.progress_callback("narration", c, t, msg),
+                    self._heartbeat_watchdog(),
+                ),
+                log_callback=self.log_callback,
             )
-        finally:
-            self._active_timeline = None
-        project.narration_wav = output_path
-        project.stale.narration = False
-        # encode narration mp3
-        mixer = self._build_mixer(project, stage="narration")
-        narration_mp3 = project.render_dir() / "narration.mp3"
-        try:
-            mixer.encode_narration_mp3(output_path, narration_mp3)
-            project.narration_mp3 = narration_mp3
-        except Exception as exc:
-            self.log_callback(f"Narration MP3 encoding skipped: {exc}")
-        self.store.save_project(project)
-        return output_path
+            self._active_timeline = renderer
+            self._arm_watchdog("render_narration")
+            try:
+                renderer.render(
+                    project,
+                    output_path,
+                    alignment=project.settings.preview.alignment,
+                )
+            except TimelineRenderCancelled as exc:
+                raise GenerationCancelled(str(exc)) from exc
+            finally:
+                self._active_timeline = None
+                self._cancel_watchdog()
+            self._check_cancelled()
+            project.narration_wav = output_path
+            project.stale.narration = False
+            # encode narration mp3
+            self._check_cancelled()
+            mixer = self._build_mixer(project, stage="narration")
+            narration_mp3 = project.render_dir() / "narration.mp3"
+            try:
+                mixer.encode_narration_mp3(output_path, narration_mp3)
+                project.narration_mp3 = narration_mp3
+            except AudioMixerCancelled as exc:
+                raise GenerationCancelled(str(exc)) from exc
+            except Exception as exc:
+                self.log_callback(f"Narration MP3 encoding skipped: {exc}")
+            self._snapshot_resources(project, label="after_narration")
+            self.save_project(project)
+            return output_path
 
     def render_dubbed_mix(
         self,
         project: DubbingProject,
         output_path: Path | None = None,
     ) -> Path:
-        self._begin_operation("render_dubbed_mix")
-        if project.narration_wav is None or not Path(project.narration_wav).is_file():
-            self.render_narration(project)
-        if output_path is None:
-            output_path = project.render_dir() / "dubbed_mix.wav"
-        mixer = self._build_mixer(project, stage="mixing")
-        self._active_mixer = mixer
-        try:
-            mixer.render_dubbed_mix(
-                project,
-                Path(project.narration_wav),
-                output_path,
-            )
-        finally:
-            self._active_mixer = None
-        project.dubbed_mix_wav = output_path
-        project.stale.mix = False
-        invalidate_for_preview_change(project.stale)
-        project.stale.video = True
-        self.store.save_project(project)
-        return output_path
+        with self._diagnostic_run(project) as run_dir, operation_span(
+            "render_dubbed_mix",
+            project_id=project.project_id,
+            run_id=getattr(run_dir, "run_id", None),
+        ):
+            self._begin_operation("render_dubbed_mix")
+            self._snapshot_resources(project, label="before_mix")
+            # Cancel checkpoint BEFORE narration: if the user cancelled during a
+            # prior stage, mix must not start (test: cancel between narration
+            # and mix does not launch mix).
+            self._check_cancelled()
+            if project.narration_wav is None or not Path(project.narration_wav).is_file():
+                self.render_narration(project)
+            # Cancel checkpoint AFTER narration, BEFORE mix.
+            self._check_cancelled()
+            if output_path is None:
+                output_path = project.render_dir() / "dubbed_mix.wav"
+            mixer = self._build_mixer(project, stage="mixing")
+            self._active_mixer = mixer
+            self._arm_watchdog("render_dubbed_mix")
+            try:
+                mixer.render_dubbed_mix(
+                    project,
+                    Path(project.narration_wav),
+                    output_path,
+                )
+            except AudioMixerCancelled as exc:
+                raise GenerationCancelled(str(exc)) from exc
+            finally:
+                self._active_mixer = None
+                self._cancel_watchdog()
+            project.dubbed_mix_wav = output_path
+            project.stale.mix = False
+            invalidate_for_preview_change(project.stale)
+            project.stale.video = True
+            self._snapshot_resources(project, label="after_mix")
+            self.save_project(project)
+            return output_path
 
     def render_cue_preview(
         self,
         project: DubbingProject,
         sequence: int,
     ) -> Path:
-        self._begin_operation("render_cue_preview", sequence=sequence)
-        cue = self._find_cue(project, sequence)
-        if cue is None:
-            raise VideoDubbingServiceError(f"Cue #{sequence} not found.")
-        renderer = self._build_preview(project)
-        self._active_preview = renderer
-        try:
-            path = renderer.render_cue_preview(project, cue)
-        finally:
-            self._active_preview = None
-        self.store.save_project(project)
-        return path
+        with self._diagnostic_run(project) as run_dir, operation_span(
+            "render_cue_preview",
+            project_id=project.project_id,
+            run_id=getattr(run_dir, "run_id", None),
+            extra={"sequence": sequence},
+        ):
+            self._begin_operation("render_cue_preview", sequence=sequence)
+            self._check_cancelled()
+            cue = self._find_cue(project, sequence)
+            if cue is None:
+                raise VideoDubbingServiceError(f"Cue #{sequence} not found.")
+            renderer = self._build_preview(project)
+            self._active_preview = renderer
+            try:
+                path = renderer.render_cue_preview(project, cue)
+            except PreviewRenderCancelled as exc:
+                raise GenerationCancelled(str(exc)) from exc
+            finally:
+                self._active_preview = None
+            self.save_project(project)
+            return path
 
     def render_full_preview(self, project: DubbingProject) -> Path:
-        self._begin_operation("render_full_preview")
-        if project.dubbed_mix_wav is None or not Path(project.dubbed_mix_wav).is_file():
-            self.render_dubbed_mix(project)
-        renderer = self._build_preview(project)
-        self._active_preview = renderer
-        try:
-            path = renderer.render_full_preview(project)
-        finally:
-            self._active_preview = None
-        project.stale.preview = False
-        self.store.save_project(project)
-        return path
+        with self._diagnostic_run(project) as run_dir, operation_span(
+            "render_full_preview",
+            project_id=project.project_id,
+            run_id=getattr(run_dir, "run_id", None),
+        ):
+            self._begin_operation("render_full_preview")
+            self._check_cancelled()
+            if project.dubbed_mix_wav is None or not Path(project.dubbed_mix_wav).is_file():
+                self.render_dubbed_mix(project)
+            self._check_cancelled()
+            renderer = self._build_preview(project)
+            self._active_preview = renderer
+            try:
+                path = renderer.render_full_preview(project)
+            except PreviewRenderCancelled as exc:
+                raise GenerationCancelled(str(exc)) from exc
+            finally:
+                self._active_preview = None
+            project.stale.preview = False
+            self.save_project(project)
+            return path
 
     def export_video(
         self,
         project: DubbingProject,
         output_path: Path | None = None,
     ) -> Path:
-        self._begin_operation(
+        with self._diagnostic_run(project) as run_dir, operation_span(
             "export_video",
-            container=project.settings.export.container.value,
-        )
-        if project.video_path is None:
-            raise VideoDubbingServiceError("No source video attached.")
-        if project.dubbed_mix_wav is None or not Path(project.dubbed_mix_wav).is_file():
-            self.render_dubbed_mix(project)
-        muxer = VideoMuxer(
-            ffmpeg_path=project.settings.ffmpeg_path,
-            progress_callback=lambda c, t, msg: self.progress_callback(
-                "muxing", c, t, msg
-            ),
-            log_callback=self.log_callback,
-        )
-        self._active_muxer = muxer
-        narration_only = (
-            project.narration_wav
-            if project.settings.export.include_narration_only
-            else None
-        )
-        srt_path = (
-            project.source_dir() / "subtitles.srt"
-            if project.settings.export.embed_subtitles
-            else None
-        )
-        if srt_path is not None and not srt_path.is_file():
-            srt_path = None
-        try:
-            result = muxer.mux(
-                project,
-                output_path=output_path,
-                narration_only_wav=narration_only,
-                srt_path=srt_path,
+            project_id=project.project_id,
+            run_id=getattr(run_dir, "run_id", None),
+            extra={"container": project.settings.export.container.value},
+        ):
+            self._begin_operation(
+                "export_video",
+                container=project.settings.export.container.value,
             )
-        except VideoMuxError as exc:
-            raise VideoDubbingServiceError(str(exc)) from exc
-        finally:
-            self._active_muxer = None
-        project.final_video_path = result.output_path
-        project.stale.video = False
-        report = build_report(project, audio_tracks=result.tracks)
-        write_reports(project, report)
-        mark_clean(project.stale)
-        self.store.save_project(project)
-        self.log_callback(f"Final video exported: {result.output_path}")
-        return result.output_path
+            self._snapshot_resources(project, label="before_mux")
+            # Cancel checkpoint BEFORE mux.
+            self._check_cancelled()
+            if project.video_path is None:
+                raise VideoDubbingServiceError("No source video attached.")
+            if project.dubbed_mix_wav is None or not Path(project.dubbed_mix_wav).is_file():
+                self.render_dubbed_mix(project)
+            # Cancel checkpoint AFTER mix, BEFORE mux (test: cancel between mix
+            # and mux does not launch mux).
+            self._check_cancelled()
+            muxer = VideoMuxer(
+                ffmpeg_path=project.settings.ffmpeg_path,
+                progress_callback=lambda c, t, msg: (
+                    self.progress_callback("muxing", c, t, msg),
+                    self._heartbeat_watchdog(),
+                ),
+                log_callback=self.log_callback,
+                stderr_dump_dir=getattr(self._active_run_dir, "subprocess_dir", None),
+            )
+            self._active_muxer = muxer
+            narration_only = (
+                project.narration_wav
+                if project.settings.export.include_narration_only
+                else None
+            )
+            srt_path = (
+                project.source_dir() / "subtitles.srt"
+                if project.settings.export.embed_subtitles
+                else None
+            )
+            if srt_path is not None and not srt_path.is_file():
+                srt_path = None
+            self._arm_watchdog("export_video")
+            try:
+                result = muxer.mux(
+                    project,
+                    output_path=output_path,
+                    narration_only_wav=narration_only,
+                    srt_path=srt_path,
+                )
+            except VideoMuxCancelled as exc:
+                raise GenerationCancelled(str(exc)) from exc
+            except VideoMuxError as exc:
+                raise VideoDubbingServiceError(str(exc)) from exc
+            finally:
+                self._active_muxer = None
+                self._cancel_watchdog()
+            self._check_cancelled()
+            project.final_video_path = result.output_path
+            project.stale.video = False
+            self._check_cancelled()
+            report = build_report(project, audio_tracks=result.tracks)
+            write_reports(project, report)
+            mark_clean(project.stale)
+            self._snapshot_resources(project, label="after_mux")
+            self.save_project(project)
+            self.log_callback(f"Final video exported: {result.output_path}")
+            return result.output_path
 
     def write_report(self, project: DubbingProject) -> tuple[Path, Path]:
         report = build_report(project)

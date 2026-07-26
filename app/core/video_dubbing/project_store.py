@@ -523,6 +523,11 @@ class DubbingProjectStore:
         )
 
     def _cue_select_sql(self) -> str:
+        # IMPORTANT: every column added by a migration MUST also appear here.
+        # A SELECT that omits migrated columns silently returns defaults on
+        # load_project(), which means SQLite and the manifest diverge and cues
+        # lose their fit/timing/elastic state after a reopen. The full
+        # round-trip is covered by test_cue_full_sqlite_round_trip.
         return (
             "SELECT cue_id, sequence, start_ms, end_ms, duration_budget_ms, "
             "source_text, spoken_text, raw_audio_path, fitted_audio_path, "
@@ -532,7 +537,13 @@ class DubbingProjectStore:
             "fitting_strategy, warning_codes_json, error_message, enabled, "
             "is_stale, attempt_count, native_speed_factor, "
             "generation_fingerprint, legacy_audio_unverified, "
-            "legacy_observed_fingerprint, hard_speed_override, force_fit "
+            "legacy_observed_fingerprint, hard_speed_override, force_fit, "
+            "fit_fingerprint, fit_pipeline_version, raw_wav_hash, "
+            "source_start_ms, source_end_ms, planned_start_ms, planned_end_ms, "
+            "timing_group_id, timing_group_position, common_speed_factor, "
+            "start_shift_ms, end_shift_ms, borrowed_right_ms, timing_locked, "
+            "planned_speed_factor, smoothing_group_id, smoothing_reason, "
+            "created_at, updated_at "
             "FROM dubbing_cues"
         )
 
