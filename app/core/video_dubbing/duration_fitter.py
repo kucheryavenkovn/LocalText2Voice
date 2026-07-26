@@ -55,25 +55,43 @@ class DurationFitter:
 
     # ------------------------------------------------------------------ windows
 
+    def _cue_start(self, cue: DubbingCue) -> int:
+        if cue.planned_start_ms is not None:
+            return cue.planned_start_ms
+        return cue.start_ms
+
+    def _cue_end(self, cue: DubbingCue) -> int:
+        if cue.planned_end_ms is not None:
+            return cue.planned_end_ms
+        return cue.end_ms
+
     def safe_end_ms(
         self,
         cue: DubbingCue,
         next_cue: DubbingCue | None,
     ) -> int:
-        end = cue.end_ms
-        if next_cue is not None and next_cue.start_ms > cue.start_ms:
-            end = min(end, next_cue.start_ms - self.settings.guard_gap_ms)
+        # Elastic groups may already set planned end / common factor.
+        if cue.planned_end_ms is not None and cue.common_speed_factor:
+            return cue.planned_end_ms
+        end = self._cue_end(cue)
+        start = self._cue_start(cue)
+        if next_cue is not None:
+            next_start = self._cue_start(next_cue)
+            if next_start > start:
+                end = min(end, next_start - self.settings.guard_gap_ms)
         if self.video_duration_ms and self.video_duration_ms > 0:
             end = min(end, self.video_duration_ms)
-        return max(cue.start_ms + 1, end)
+        return max(start + 1, end)
 
     def target_duration_ms(
         self,
         cue: DubbingCue,
         next_cue: DubbingCue | None,
     ) -> int:
+        if cue.target_duration_ms and cue.common_speed_factor:
+            return max(1, int(cue.target_duration_ms))
         safe_end = self.safe_end_ms(cue, next_cue)
-        return max(1, safe_end - cue.start_ms)
+        return max(1, safe_end - self._cue_start(cue))
 
     # ------------------------------------------------------------------ evaluate
 
@@ -91,11 +109,84 @@ class DurationFitter:
             )
 
         safe_end = self.safe_end_ms(cue, next_cue)
-        target_ms = max(1, safe_end - cue.start_ms)
-        required = raw_ms / target_ms
+        start_ms = self._cue_start(cue)
+        if cue.target_duration_ms and cue.common_speed_factor:
+            target_ms = max(1, int(cue.target_duration_ms))
+            required = float(cue.common_speed_factor)
+        else:
+            target_ms = max(1, safe_end - start_ms)
+            required = raw_ms / target_ms
 
         preferred = self.settings.preferred_speed_limit
         hard = self._hard_limit_for(cue)
+        # Tempo smoothing: force a planned factor without changing timecodes.
+        if cue.planned_speed_factor and cue.planned_speed_factor > 1.0 + 1e-6:
+            applied = float(cue.planned_speed_factor)
+            fitted = max(1, int(round(raw_ms / applied)))
+            # Keep speech inside the source/planned window.
+            if fitted > target_ms:
+                applied = max(required, raw_ms / target_ms)
+                fitted = max(1, int(round(raw_ms / applied)))
+            status = CueStatus.SPEED_UP.value
+            warnings = [f"tempo_smooth_{applied:.3f}"]
+            if applied > preferred:
+                status = CueStatus.STRONG_SPEED_UP.value
+            if applied > hard and not cue.force_fit:
+                return FittingResult(
+                    strategy=FittingStrategy.NONE,
+                    applied_speed_factor=1.0,
+                    fitted_duration_ms=raw_ms,
+                    overflow_ms=max(0, raw_ms - target_ms),
+                    status=CueStatus.EXTREME_SPEED_REQUIRED.value,
+                    warning_codes=warnings + ["smooth_exceeds_hard"],
+                    target_duration_ms=target_ms,
+                    safe_end_ms=safe_end,
+                    timing_diff_ms=max(0, raw_ms - target_ms),
+                    blocking=True,
+                )
+            return FittingResult(
+                strategy=FittingStrategy.ATEMPO if applied > 1.001 else FittingStrategy.NONE,
+                applied_speed_factor=applied,
+                fitted_duration_ms=min(fitted, target_ms) if fitted > target_ms else fitted,
+                overflow_ms=0,
+                status=status if applied > 1.001 else CueStatus.RENDERED.value,
+                warning_codes=warnings,
+                target_duration_ms=target_ms,
+                safe_end_ms=safe_end,
+                timing_diff_ms=max(0, fitted - target_ms),
+            )
+        if cue.common_speed_factor and cue.common_speed_factor > 1.0:
+            # Elastic group forces a shared factor.
+            applied = float(cue.common_speed_factor)
+            fitted = max(1, int(round(raw_ms / applied)))
+            status = CueStatus.SPEED_UP.value
+            warnings = [f"elastic_common_factor_{applied:.3f}"]
+            if applied > preferred:
+                status = CueStatus.STRONG_SPEED_UP.value
+            if applied > hard and not cue.force_fit:
+                return FittingResult(
+                    strategy=FittingStrategy.NONE,
+                    applied_speed_factor=1.0,
+                    fitted_duration_ms=raw_ms,
+                    overflow_ms=max(0, raw_ms - target_ms),
+                    status=CueStatus.EXTREME_SPEED_REQUIRED.value,
+                    warning_codes=warnings + ["elastic_exceeds_hard"],
+                    target_duration_ms=target_ms,
+                    safe_end_ms=safe_end,
+                    timing_diff_ms=max(0, raw_ms - target_ms),
+                    blocking=True,
+                )
+            return FittingResult(
+                strategy=FittingStrategy.ATEMPO if applied > 1.001 else FittingStrategy.NONE,
+                applied_speed_factor=applied,
+                fitted_duration_ms=fitted,
+                overflow_ms=0,
+                status=status if applied > 1.001 else CueStatus.RENDERED.value,
+                warning_codes=warnings,
+                target_duration_ms=target_ms,
+                safe_end_ms=safe_end,
+                timing_diff_ms=max(0, fitted - target_ms),
+            )
 
         base = FittingResult(
             strategy=FittingStrategy.NONE,

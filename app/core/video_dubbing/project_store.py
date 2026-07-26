@@ -21,7 +21,7 @@ from .models import (
 )
 
 
-CURRENT_DB_SCHEMA_VERSION = 2
+CURRENT_DB_SCHEMA_VERSION = 3
 DUBBING_MANIFEST_NAME = "dubbing_project.json"
 
 
@@ -187,6 +187,23 @@ class DubbingProjectStore:
             "legacy_observed_fingerprint": "TEXT DEFAULT ''",
             "hard_speed_override": "REAL DEFAULT 0",
             "force_fit": "INTEGER DEFAULT 0",
+            "fit_fingerprint": "TEXT DEFAULT ''",
+            "fit_pipeline_version": "INTEGER DEFAULT 0",
+            "raw_wav_hash": "TEXT DEFAULT ''",
+            "source_start_ms": "INTEGER",
+            "source_end_ms": "INTEGER",
+            "planned_start_ms": "INTEGER",
+            "planned_end_ms": "INTEGER",
+            "timing_group_id": "TEXT",
+            "timing_group_position": "INTEGER",
+            "common_speed_factor": "REAL",
+            "start_shift_ms": "INTEGER DEFAULT 0",
+            "end_shift_ms": "INTEGER DEFAULT 0",
+            "borrowed_right_ms": "INTEGER DEFAULT 0",
+            "timing_locked": "INTEGER DEFAULT 0",
+            "planned_speed_factor": "REAL",
+            "smoothing_group_id": "TEXT",
+            "smoothing_reason": "TEXT DEFAULT ''",
         }
         for name, definition in additions.items():
             if name not in existing:
@@ -337,6 +354,11 @@ class DubbingProjectStore:
                     native_speed_factor, generation_fingerprint,
                     legacy_audio_unverified, legacy_observed_fingerprint,
                     hard_speed_override, force_fit,
+                    fit_fingerprint, fit_pipeline_version, raw_wav_hash,
+                    source_start_ms, source_end_ms, planned_start_ms, planned_end_ms,
+                    timing_group_id, timing_group_position, common_speed_factor,
+                    start_shift_ms, end_shift_ms, borrowed_right_ms, timing_locked,
+                    planned_speed_factor, smoothing_group_id, smoothing_reason,
                     created_at, updated_at
                 )
                 VALUES ({placeholders})
@@ -371,6 +393,23 @@ class DubbingProjectStore:
                     legacy_observed_fingerprint=excluded.legacy_observed_fingerprint,
                     hard_speed_override=excluded.hard_speed_override,
                     force_fit=excluded.force_fit,
+                    fit_fingerprint=excluded.fit_fingerprint,
+                    fit_pipeline_version=excluded.fit_pipeline_version,
+                    raw_wav_hash=excluded.raw_wav_hash,
+                    source_start_ms=excluded.source_start_ms,
+                    source_end_ms=excluded.source_end_ms,
+                    planned_start_ms=excluded.planned_start_ms,
+                    planned_end_ms=excluded.planned_end_ms,
+                    timing_group_id=excluded.timing_group_id,
+                    timing_group_position=excluded.timing_group_position,
+                    common_speed_factor=excluded.common_speed_factor,
+                    start_shift_ms=excluded.start_shift_ms,
+                    end_shift_ms=excluded.end_shift_ms,
+                    borrowed_right_ms=excluded.borrowed_right_ms,
+                    timing_locked=excluded.timing_locked,
+                    planned_speed_factor=excluded.planned_speed_factor,
+                    smoothing_group_id=excluded.smoothing_group_id,
+                    smoothing_reason=excluded.smoothing_reason,
                     updated_at=excluded.updated_at
                 """,
                 (project_db_id, *values),
@@ -623,6 +662,23 @@ class DubbingProjectStore:
             cue.legacy_observed_fingerprint or "",
             cue.hard_speed_override,
             1 if cue.force_fit else 0,
+            cue.fit_fingerprint or "",
+            int(cue.fit_pipeline_version or 0),
+            cue.raw_wav_hash or "",
+            cue.source_start_ms,
+            cue.source_end_ms,
+            cue.planned_start_ms,
+            cue.planned_end_ms,
+            cue.timing_group_id,
+            cue.timing_group_position,
+            cue.common_speed_factor,
+            int(cue.start_shift_ms or 0),
+            int(cue.end_shift_ms or 0),
+            int(cue.borrowed_right_ms or 0),
+            1 if cue.timing_locked else 0,
+            cue.planned_speed_factor,
+            cue.smoothing_group_id,
+            cue.smoothing_reason or "",
             now,
             now,
         )
@@ -650,6 +706,11 @@ class DubbingProjectStore:
                 native_speed_factor, generation_fingerprint,
                 legacy_audio_unverified, legacy_observed_fingerprint,
                 hard_speed_override, force_fit,
+                fit_fingerprint, fit_pipeline_version, raw_wav_hash,
+                source_start_ms, source_end_ms, planned_start_ms, planned_end_ms,
+                timing_group_id, timing_group_position, common_speed_factor,
+                start_shift_ms, end_shift_ms, borrowed_right_ms, timing_locked,
+                    planned_speed_factor, smoothing_group_id, smoothing_reason,
                 created_at, updated_at
             )
             VALUES ({placeholders})
@@ -728,6 +789,14 @@ class DubbingProjectStore:
                 return None
             return float(value) if value is not None else None
 
+        def _get(name: str, default: Any = None) -> Any:
+            try:
+                value = row[name]
+            except (KeyError, IndexError):
+                return default
+            return default if value is None else value
+
+        keys = set(row.keys())
         return DubbingCue(
             cue_id=str(row["cue_id"]),
             sequence=int(row["sequence"]),
@@ -766,6 +835,31 @@ class DubbingProjectStore:
             ),
             hard_speed_override=float(row["hard_speed_override"] or 0),
             force_fit=bool(row["force_fit"]),
+            fit_fingerprint=str(_get("fit_fingerprint", "") or ""),
+            fit_pipeline_version=int(_get("fit_pipeline_version", 0) or 0),
+            raw_wav_hash=str(_get("raw_wav_hash", "") or ""),
+            source_start_ms=_opt_int("source_start_ms") if "source_start_ms" in keys else None,
+            source_end_ms=_opt_int("source_end_ms") if "source_end_ms" in keys else None,
+            planned_start_ms=_opt_int("planned_start_ms") if "planned_start_ms" in keys else None,
+            planned_end_ms=_opt_int("planned_end_ms") if "planned_end_ms" in keys else None,
+            timing_group_id=(
+                str(_get("timing_group_id"))
+                if _get("timing_group_id") not in (None, "")
+                else None
+            ),
+            timing_group_position=_opt_int("timing_group_position"),
+            common_speed_factor=_opt_float("common_speed_factor"),
+            start_shift_ms=int(_get("start_shift_ms", 0) or 0),
+            end_shift_ms=int(_get("end_shift_ms", 0) or 0),
+            borrowed_right_ms=int(_get("borrowed_right_ms", 0) or 0),
+            timing_locked=bool(_get("timing_locked", 0)),
+            planned_speed_factor=_opt_float("planned_speed_factor"),
+            smoothing_group_id=(
+                str(_get("smoothing_group_id"))
+                if _get("smoothing_group_id") not in (None, "")
+                else None
+            ),
+            smoothing_reason=str(_get("smoothing_reason", "") or ""),
         )
 
     # ------------------------------------------------------------------ manifest
@@ -803,6 +897,23 @@ class DubbingProjectStore:
             "legacy_observed_fingerprint": cue.legacy_observed_fingerprint,
             "hard_speed_override": cue.hard_speed_override,
             "force_fit": cue.force_fit,
+            "fit_fingerprint": cue.fit_fingerprint,
+            "fit_pipeline_version": cue.fit_pipeline_version,
+            "raw_wav_hash": cue.raw_wav_hash,
+            "source_start_ms": cue.source_start_ms,
+            "source_end_ms": cue.source_end_ms,
+            "planned_start_ms": cue.planned_start_ms,
+            "planned_end_ms": cue.planned_end_ms,
+            "timing_group_id": cue.timing_group_id,
+            "timing_group_position": cue.timing_group_position,
+            "common_speed_factor": cue.common_speed_factor,
+            "start_shift_ms": cue.start_shift_ms,
+            "end_shift_ms": cue.end_shift_ms,
+            "borrowed_right_ms": cue.borrowed_right_ms,
+            "timing_locked": cue.timing_locked,
+            "planned_speed_factor": cue.planned_speed_factor,
+            "smoothing_group_id": cue.smoothing_group_id,
+            "smoothing_reason": cue.smoothing_reason,
         }
 
     def load_project_from_manifest(self, manifest_path: Path) -> DubbingProject:
@@ -930,4 +1041,57 @@ class DubbingProjectStore:
             ),
             hard_speed_override=float(data.get("hard_speed_override") or 0),
             force_fit=bool(data.get("force_fit", False)),
+            fit_fingerprint=str(data.get("fit_fingerprint") or ""),
+            fit_pipeline_version=int(data.get("fit_pipeline_version") or 0),
+            raw_wav_hash=str(data.get("raw_wav_hash") or ""),
+            source_start_ms=(
+                int(data["source_start_ms"])
+                if data.get("source_start_ms") is not None
+                else None
+            ),
+            source_end_ms=(
+                int(data["source_end_ms"])
+                if data.get("source_end_ms") is not None
+                else None
+            ),
+            planned_start_ms=(
+                int(data["planned_start_ms"])
+                if data.get("planned_start_ms") is not None
+                else None
+            ),
+            planned_end_ms=(
+                int(data["planned_end_ms"])
+                if data.get("planned_end_ms") is not None
+                else None
+            ),
+            timing_group_id=(
+                str(data.get("timing_group_id"))
+                if data.get("timing_group_id") not in (None, "")
+                else None
+            ),
+            timing_group_position=(
+                int(data["timing_group_position"])
+                if data.get("timing_group_position") is not None
+                else None
+            ),
+            common_speed_factor=(
+                float(data["common_speed_factor"])
+                if data.get("common_speed_factor") is not None
+                else None
+            ),
+            start_shift_ms=int(data.get("start_shift_ms") or 0),
+            end_shift_ms=int(data.get("end_shift_ms") or 0),
+            borrowed_right_ms=int(data.get("borrowed_right_ms") or 0),
+            timing_locked=bool(data.get("timing_locked", False)),
+            planned_speed_factor=(
+                float(data["planned_speed_factor"])
+                if data.get("planned_speed_factor") is not None
+                else None
+            ),
+            smoothing_group_id=(
+                str(data.get("smoothing_group_id"))
+                if data.get("smoothing_group_id") not in (None, "")
+                else None
+            ),
+            smoothing_reason=str(data.get("smoothing_reason") or ""),
         )

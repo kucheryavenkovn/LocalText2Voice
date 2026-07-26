@@ -5,6 +5,11 @@ from typing import Any, Callable
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+from app.core.video_dubbing.generation import (
+    GenerationCancelled,
+    GenerationRunResult,
+    GenerationRunStatus,
+)
 from app.core.video_dubbing.service import (
     VideoDubbingService,
     VideoDubbingServiceError,
@@ -46,7 +51,18 @@ class VideoDubbingWorker(QObject):
             if self._cancel_requested:
                 self.service.cancel()
             result = self.operation(self.service)
+            if isinstance(result, GenerationRunResult):
+                if result.status == GenerationRunStatus.CANCELLED:
+                    self.cancelled.emit()
+                    return
+                if result.status == GenerationRunStatus.FAILED:
+                    self.failed.emit(
+                        result.error_message or "Generation stopped due to error"
+                    )
+                    return
             self.finished.emit(result)
+        except GenerationCancelled:
+            self.cancelled.emit()
         except VideoDubbingServiceError as exc:
             if "cancelled" in str(exc).casefold():
                 self.cancelled.emit()

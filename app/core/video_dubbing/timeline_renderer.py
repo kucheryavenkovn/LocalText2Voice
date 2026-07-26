@@ -131,7 +131,7 @@ class TimelineRenderer:
                     cue_id=cue.cue_id,
                     sequence=cue.sequence,
                     audio_path=Path(fitted),
-                    absolute_start_ms=cue.start_ms + offset,
+                    absolute_start_ms=cue.effective_start_ms() + offset,
                     duration_ms=duration_ms,
                 )
             )

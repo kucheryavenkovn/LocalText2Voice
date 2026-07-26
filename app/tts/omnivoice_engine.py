@@ -56,11 +56,21 @@ class OmniVoiceTTSEngine(BaseTTSEngine):
         output_wav: Path,
         voice_config: dict[str, Any],
     ) -> Path:
+        # A previous cancel_current() leaves a sticky flag; clear it at the start
+        # of a new synthesis so "Force regenerate" works after Cancel.
+        self._cancel_requested.clear()
         self.validate(voice_config)
         if self._cancel_requested.is_set():
             raise TTSCancelled("Generation cancelled.")
 
         output_wav.parent.mkdir(parents=True, exist_ok=True)
+        # Restart worker when the reference speaker changes so clone prompt cache
+        # and worker script stay in sync with the selected gallery voice.
+        ref_now = str(voice_config.get("reference_audio_path", "") or "").strip()
+        prev_ref = getattr(self, "_last_ref_audio_path", "")
+        if ref_now and prev_ref and ref_now != prev_ref:
+            self._close_worker(force=False)
+        self._last_ref_audio_path = ref_now
         process = self._ensure_worker(voice_config)
         request_id = self._next_request_id()
         request: dict[str, Any] = {
@@ -78,8 +88,27 @@ class OmniVoiceTTSEngine(BaseTTSEngine):
             "speed": float(voice_config.get("engine_speed", 1.0) or 1.0),
         }
         language = str(voice_config.get("language", "auto") or "auto").strip()
+        lang_map = {
+            "ru": "Russian",
+            "en": "English",
+            "es": "Spanish",
+            "fr": "French",
+            "de": "German",
+            "zh": "Chinese",
+            "ja": "Japanese",
+            "ko": "Korean",
+            "pt": "Portuguese",
+            "it": "Italian",
+        }
         if language and language.casefold() not in {"auto", "default"}:
-            request["language"] = language
+            request["language"] = lang_map.get(language.casefold(), language)
+        # Always log the absolute reference path used for clone.
+        ref_for_log = str(voice_config.get("reference_audio_path", "") or "").strip()
+        if ref_for_log:
+            self.log_callback(
+                f"OmniVoice clone ref: {Path(ref_for_log).parent.name}/"
+                f"{Path(ref_for_log).name}"
+            )
         duration = float(voice_config.get("duration", 0.0) or 0.0)
         if duration > 0:
             request["duration"] = duration

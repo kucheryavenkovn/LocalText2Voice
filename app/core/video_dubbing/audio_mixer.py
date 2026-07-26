@@ -90,14 +90,14 @@ class AudioMixer:
         for cue in cues:
             if not cue.enabled:
                 continue
-            start = cue.start_ms
-            end = cue.start_ms + max(
+            start = cue.effective_start_ms()
+            end = start + max(
                 cue.fitted_duration_ms or cue.duration_budget_ms,
                 cue.duration_budget_ms,
             )
             if cue.fitted_duration_ms:
-                end = cue.start_ms + cue.fitted_duration_ms
-            end = min(end, cue.end_ms + max(0, cue.overflow_ms))
+                end = start + cue.fitted_duration_ms
+            end = min(end, cue.effective_end_ms() + max(0, cue.overflow_ms))
             if end > start:
                 intervals.append((start, end))
         intervals.sort()

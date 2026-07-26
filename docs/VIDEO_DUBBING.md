@@ -14,14 +14,14 @@ This is **not** lip-sync. The video track is never modified.
    and output container. The video duration (from FFprobe) fixes the length of
    the narration/mix tracks.
 2. **Import SRT** — parsed into per-cue models with validation warnings.
-3. **Generate** — each cue is synthesized via the existing `BaseTTSEngine`,
-   normalized to PCM 48 kHz, measured, and fit to its window.
-4. **Fit** — `required_speed_factor = raw_duration / budget`. If within the
-   limit, FFmpeg `atempo` is applied. If over the limit, the cue is flagged
-   `needs_text_shortening` (strict blocks export; best-effort applies the cap).
+3. **Generate (TTS)** — each cue is synthesized via the existing `BaseTTSEngine`,
+   normalized to PCM, measured. This produces **raw** speech at natural length.
+4. **Fit / Recalculate** — `required_speed_factor = raw_duration / budget`. FFmpeg
+   `atempo` is applied to build **fitted** WAVs. Elastic groups and tempo
+   smoothing run here too. **Right shifts do not re-run TTS.**
 5. **Render narration** — a single track exactly as long as the video, with
-   each fitted cue placed at its absolute timecode and silence elsewhere. No
-   cumulative drift.
+   each fitted cue placed at its absolute (or planned) timecode and silence
+   elsewhere. No cumulative drift.
 6. **Render mix** — original audio + narration + dynamic ducking (driven by a
    timecode gain mask, not an envelope follower).
 7. **Preview** — short per-cue preview clips and a full-project preview, both
@@ -30,6 +30,30 @@ This is **not** lip-sync. The video track is never modified.
 8. **Export** — final MP4/MKV with: Original track, Dubbed Mix (default),
    optional Narration Only, optional embedded subtitles. Video is copied
    (`-c:v copy`) when the codec is container-compatible.
+9. **Optional review** — More → Cue review opens the shared Whisper review UI
+   on cue WAVs (play + verify; audiobook rebuild disabled).
+
+### Timing vs speed-up
+
+| Layer | Changes | Needs TTS? | Button |
+| --- | --- | --- | --- |
+| Raw generation | voice, text, engine | Yes | Create speech / Force all |
+| Fit / atempo | speed limits, pauses | No | Recalculate |
+| Elastic groups | planned start/end, right shift | No | Recalculate |
+| Tempo smoothing | planned speed factors only (strict) | No | Recalculate |
+| Narration / mix / mux | placement + levels | No | Narration / Mix / Video |
+
+### Timeline colors
+
+| Color | Meaning |
+| --- | --- |
+| Green | Ready, little/no speed-up |
+| Blue | Mild speed-up |
+| Orange | Strong speed-up |
+| Red | Failed / needs shortening / overflow |
+| Yellow outline | Selected |
+| Cyan dashed | Elastic/tempo group (and shift) |
+| Dim gray underlay | Original SRT window |
 
 ## Architecture
 

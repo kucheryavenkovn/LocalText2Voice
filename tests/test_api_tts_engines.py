@@ -242,14 +242,24 @@ class ApiTTSEngineTests(unittest.TestCase):
                 self.assertEqual(audio.getnchannels(), 1)
 
     def test_gemini_engine_requires_api_key(self) -> None:
+        import os
+        from unittest import mock
+
         engine = GeminiTTSEngine()
-        with self.assertRaisesRegex(TTSEngineError, "API key"):
-            engine.validate(
-                {
-                    "model": "gemini-3.1-flash-tts-preview",
-                    "voice": "Kore",
-                }
-            )
+        cleaned = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"GEMINI_API_KEY", "GOOGLE_API_KEY"}
+        }
+        with mock.patch.dict(os.environ, cleaned, clear=True):
+            with self.assertRaisesRegex(TTSEngineError, "API key"):
+                engine.validate(
+                    {
+                        "model": "gemini-3.1-flash-tts-preview",
+                        "voice": "Kore",
+                        "api_key": "",
+                    }
+                )
 
     def test_custom_http_engine_builds_template_request(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_name:

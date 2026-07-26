@@ -77,6 +77,17 @@ class VoiceCatalogService:
         elif engine_id == "qwen":
             config["speaker"] = voice_id
         elif engine_id in {"chatterbox", "omnivoice"}:
+            # Drop any previous speaker clip before resolving the new one.
+            for key in (
+                "reference_audio_path",
+                "reference_text",
+                "reference_voice_name",
+                "reference_voice_content_hash",
+                "ref_audio",
+                "ref_text",
+            ):
+                config.pop(key, None)
+            config["mode"] = str(config.get("mode") or "clone")
             ref = self._resolve_reference_voice(engine_id, voice_id)
             if ref is not None:
                 manager, voice = ref
@@ -85,12 +96,38 @@ class VoiceCatalogService:
                 except Exception:
                     audio_path = None
                 if audio_path:
+                    from .fingerprints import reference_voice_identity
+
                     config["reference_audio_path"] = str(audio_path)
-                    if getattr(voice, "ref_text", ""):
-                        config["reference_text"] = voice.ref_text
-                config.setdefault("reference_audio_path", voice_id)
+                    identity = reference_voice_identity(audio_path)
+                    if identity.get("content_hash"):
+                        config["reference_voice_content_hash"] = identity["content_hash"]
+                    config["reference_text"] = getattr(voice, "ref_text", "") or ""
+                    config["reference_voice_name"] = getattr(voice, "name", voice_id)
+                    config["voice"] = getattr(voice, "name", voice_id)
+                    language = getattr(voice, "language", None)
+                    if language:
+                        config.setdefault("language", language)
+                else:
+                    raise RuntimeError(
+                        f"Reference audio for voice '{voice_id}' is missing or unreadable."
+                    )
             else:
-                config.setdefault("reference_audio_path", voice_id)
+                from pathlib import Path
+
+                from .fingerprints import file_content_hash
+
+                candidate = Path(voice_id)
+                if candidate.is_file():
+                    config["reference_audio_path"] = str(candidate.resolve())
+                    content_hash = file_content_hash(candidate)
+                    if content_hash:
+                        config["reference_voice_content_hash"] = content_hash
+                    config["voice"] = candidate.stem
+                else:
+                    raise RuntimeError(
+                        f"Unknown reference voice '{voice_id}' for engine {engine_id}."
+                    )
         elif engine_id in {"openai", "gemini", "azure"}:
             config["voice"] = voice_id
         elif engine_id == "elevenlabs":
@@ -183,14 +220,38 @@ class VoiceCatalogService:
         result.sort(key=lambda v: v.display_name.lower())
         return result
 
+    @staticmethod
+    def _normalize_voice_key(value: str) -> str:
+        text = str(value or "").strip()
+        if " — " in text:
+            text = text.split(" — ", 1)[0].strip()
+        if " - " in text:
+            # Tolerate "Name - ru" variants.
+            left, right = text.rsplit(" - ", 1)
+            if len(right) <= 8:
+                text = left.strip()
+        return text.casefold()
+
     def _resolve_reference_voice(self, engine_id: str, voice_id: str):
         try:
             from app.tts.voice_gallery_manager import VoiceGalleryManager
 
             manager = VoiceGalleryManager()
             manager.ensure_seed_loaded()
+            target = self._normalize_voice_key(voice_id)
             for voice in manager.list_voices(engine_id):
-                if voice.name == voice_id and manager.preview_source(voice):
+                candidates = {
+                    getattr(voice, "name", ""),
+                    getattr(voice, "display_name", ""),
+                    getattr(voice, "voice_id", ""),
+                }
+                if not any(
+                    self._normalize_voice_key(str(candidate)) == target
+                    for candidate in candidates
+                    if candidate
+                ):
+                    continue
+                if manager.preview_source(voice):
                     return manager, voice
         except Exception:  # pragma: no cover
             return None
