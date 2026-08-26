@@ -52,6 +52,7 @@ class ChatterboxTTSEngine(BaseTTSEngine):
         output_wav: Path,
         voice_config: dict[str, Any],
     ) -> Path:
+        self._cancel_requested.clear()
         self.validate(voice_config)
         if self._cancel_requested.is_set():
             raise TTSCancelled("Generation cancelled.")

@@ -37,11 +37,39 @@ class MainWindowUITests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.application = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        # Isolate from the real network update check: MainWindow schedules a
+        # QTimer that eventually calls the GitHub update endpoint. Replace the
+        # scheduler method with a no-op so tests never hit the network.
+        # Production behaviour is unchanged.
+        check_patcher = patch.object(
+            MainWindow, "_maybe_check_for_updates", return_value=None
+        )
+        check_patcher.start()
+        self.addCleanup(check_patcher.stop)
+        # Point the settings manager and app data at a per-test temp dir so the
+        # developer's real config.json (which may be Russian, have saved state,
+        # etc.) never influences the suite. Save works normally against the temp
+        # config, so persistence/switch tests remain meaningful.
+        self._settings_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._settings_tmp.cleanup)
+        self._settings_root = Path(self._settings_tmp.name)
+        # Only redirect the settings config path (in the settings_manager
+        # module), NOT application_root in paths — resource_root() must keep
+        # resolving the real locales/assets.
+        import app.core.settings_manager as _sm
+
+        self._sm_patcher = patch.object(
+            _sm, "application_root", lambda *a, **k: self._settings_root
+        )
+        self._sm_patcher.start()
+        self.addCleanup(self._sm_patcher.stop)
+
     def test_generation_and_settings_views_are_separate(self) -> None:
         window = MainWindow()
         self.addCleanup(window.deleteLater)
 
-        self.assertEqual(window.page_stack.count(), 6)
+        self.assertEqual(window.page_stack.count(), 7)
         window._select_tts_engine("piper")
         self.assertEqual(window.page_stack.currentIndex(), 0)
         self.assertEqual(window.ui_language_combo.count(), 11)
@@ -602,7 +630,9 @@ class MainWindowUITests(unittest.TestCase):
             ["Proyecto MCP", "Proyecto anterior"],
         )
         with patch.object(window, "_load_project") as load_project:
-            actions[0].trigger()
+            # Avoid the modal confirmation dialog (would block a headless run).
+            with patch.object(window, "_confirm_project_switch", return_value=True):
+                actions[0].trigger()
         load_project.assert_called_once_with(recent.id)
         self.assertNotEqual(older.id, recent.id)
 

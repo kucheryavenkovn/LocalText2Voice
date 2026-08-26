@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import tempfile
 import threading
@@ -1191,6 +1192,125 @@ class AudiobookRebuildWorker(QObject):
     def _check_cancelled(self) -> None:
         if self._cancel_requested.is_set():
             raise FFmpegCancelled("Audiobook rebuild cancelled.")
+
+
+class DubbingListVerificationWorker(QObject):
+    """Whisper-transcribe an in-memory list of cue segments (video dubbing).
+
+    Does not touch AudiobookStore and does not regenerate audio.
+    Updates segment fields in place (similarity, transcript, status).
+    """
+
+    progress = Signal(int, int, str)
+    log = Signal(str)
+    finished = Signal()
+    failed = Signal(str)
+    cancelled = Signal()
+    segment_updated = Signal(object)
+
+    def __init__(
+        self,
+        segments: list[StoredSegment],
+        verifier: FasterWhisperVerifier | None,
+        device: str,
+        compute_type: str,
+        language: str,
+        beam_size: int,
+        approve_threshold: float,
+        only_unverified: bool = True,
+    ) -> None:
+        super().__init__()
+        self.segments = list(segments)
+        self.verifier = verifier or FasterWhisperVerifier()
+        self.owns_verifier = verifier is None
+        self.device = device
+        self.compute_type = compute_type
+        self.language = language
+        self.beam_size = beam_size
+        self.approve_threshold = approve_threshold
+        self.only_unverified = only_unverified
+        self._cancel_requested = threading.Event()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.verifier.set_log_callback(self.log.emit)
+            pending = [
+                segment
+                for segment in self.segments
+                if Path(segment.wav_path).is_file()
+                and (
+                    not self.only_unverified
+                    or segment.similarity_score is None
+                    or segment.verification_status
+                    in {"", "pending", "not_verified"}
+                )
+            ]
+            total = len(pending)
+            if total == 0:
+                self.log.emit("No pending dubbing cues found for Whisper review.")
+                self.finished.emit()
+                return
+            self.log.emit(f"Whisper review for {total} dubbing cue(s)...")
+            for index, segment in enumerate(pending, start=1):
+                if self._cancel_requested.is_set():
+                    raise FasterWhisperCancelled("Verification cancelled.")
+                self.progress.emit(
+                    index - 1, total, f"Cue {segment.sequence_index} ({index}/{total})..."
+                )
+                language = self.language
+                if language in {"", "auto"} and segment.language:
+                    language = segment.language
+                result = self.verifier.transcribe(
+                    Path(segment.wav_path),
+                    language=language if language not in {"", "auto"} else "auto",
+                    beam_size=self.beam_size,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                )
+                transcript = str(result.get("text", "")).strip()
+                metrics = similarity_metrics(segment.source_text, transcript)
+                score = float(metrics["similarity_score"])
+                status = verification_status(score, self.approve_threshold)
+                words_json = json.dumps(
+                    result.get("words", []), ensure_ascii=False
+                )
+                # StoredSegment is frozen — emit a replaced instance via
+                # dataclasses.replace so every other field is preserved.
+                updated = dataclasses.replace(
+                    segment,
+                    status="verified",
+                    similarity_score=score,
+                    verification_status=status,
+                    transcript_text=transcript,
+                    word_timestamps_json=words_json,
+                )
+                # Keep list in worker in sync for any later pass.
+                for i, item in enumerate(self.segments):
+                    if item.id == segment.id:
+                        self.segments[i] = updated
+                        break
+                self.log.emit(
+                    f"Cue {updated.sequence_index}: {status} "
+                    f"similarity={score:.1f}% transcript={transcript[:80]!r}"
+                )
+                self.segment_updated.emit(updated)
+                self.progress.emit(index, total, f"Reviewed {index}/{total}.")
+            self.finished.emit()
+        except FasterWhisperCancelled:
+            self.cancelled.emit()
+        except (FasterWhisperError, PythonRuntimeError) as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            traceback.print_exc()
+            self.failed.emit(f"Unexpected dubbing verification error: {exc}")
+        finally:
+            if self.owns_verifier:
+                self.verifier.close()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
+        self.verifier.cancel_current()
 
 
 def _wav_duration_seconds(path: Path) -> float:

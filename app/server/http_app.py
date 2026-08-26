@@ -13,6 +13,16 @@ from app.core.settings_manager import SettingsManager
 from app.server.job_manager import LocalServerJobManager, wait_for_job
 from app.server.job_source_editor import JobSourceEditor
 from app.server.ltv_service import LocalText2VoiceService, public_settings_snapshot
+from app.server.video_dubbing import (
+    DubbingJobManager,
+    EngineLeaseProvider,
+    ProjectLockRegistry,
+    VideoDubbingFacade,
+)
+from app.server.video_dubbing.fault_injection import make_default_injector
+from app.server.video_dubbing.http_routes import register_video_dubbing_http_routes
+from app.server.video_dubbing.mcp_tools import register_video_dubbing_mcp_tools
+from app.server.video_dubbing.revision_snapshots import RevisionStore
 from app.utils.paths import application_root
 
 
@@ -560,6 +570,34 @@ def create_http_app(
         return FileResponse(path, media_type="audio/mpeg", filename=path.name)
 
     app.mount("/mcp", mcp_app)
+
+    # ------------------------------------------------------------------ video dubbing
+    # Compose the video-dubbing control plane on the SAME MCP + FastAPI app.
+    # No second MCP server is created; composition only.
+    dubbing_locks = ProjectLockRegistry()
+    dubbing_engine_provider = EngineLeaseProvider(ltv_service=service)
+    dubbing_job_manager = DubbingJobManager(
+        max_parallel_jobs=int(server_settings.get("max_parallel_jobs", 1) or 1),
+        locks=dubbing_locks,
+    )
+    video_dubbing_facade = VideoDubbingFacade(
+        engine_provider=dubbing_engine_provider,
+        job_manager=dubbing_job_manager,
+        locks=dubbing_locks,
+        revision_store=RevisionStore(),
+    )
+    dubbing_fault_injector = make_default_injector(server_settings)
+    register_video_dubbing_mcp_tools(
+        mcp=mcp,
+        facade=video_dubbing_facade,
+        job_manager=dubbing_job_manager,
+        fault_injector=dubbing_fault_injector,
+    )
+    register_video_dubbing_http_routes(
+        app=app,
+        facade=video_dubbing_facade,
+        fault_injector=dubbing_fault_injector,
+    )
     return app
 
 

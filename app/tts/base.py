@@ -20,6 +20,13 @@ class BaseTTSEngine(ABC):
         is_set = getattr(event, "is_set", None)
         return bool(is_set()) if callable(is_set) else False
 
+    def clear_cancel(self) -> None:
+        """Allow a new synthesis after cancel_current() was used."""
+        event = getattr(self, "_cancel_requested", None)
+        clear = getattr(event, "clear", None)
+        if callable(clear):
+            clear()
+
     def set_log_callback(self, callback: Callable[[str], None]) -> None:
         """Allow engines to report optional runtime diagnostics."""
 

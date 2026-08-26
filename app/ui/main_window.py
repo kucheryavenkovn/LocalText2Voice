@@ -172,6 +172,7 @@ from mutagen import File as MutagenFile
 from .audio_mix_preview_panel import AudioMixPreviewContext, AudioMixPreviewPanel
 from .icons import ICON_LIGHT, ui_icon
 from .markup_highlighter import LTVMarkupHighlighter
+from .video_dubbing_page import VideoDubbingPage
 from .voice_manager_dialog import VoiceManagerDialog
 from .widgets import FilePicker, LogView, PathPicker
 
@@ -889,6 +890,15 @@ class MainWindow(QMainWindow):
         )
         self.page_stack.addWidget(self.audio_mix_preview_panel)
         self.page_stack.addWidget(self._build_voices_page())
+        self.video_dubbing_page = VideoDubbingPage(
+            self.tr,
+            ffmpeg_path=str(self.settings.get("ffmpeg_path", "ffmpeg/ffmpeg.exe")),
+            piper_path=str(self.settings.get("piper_path", "engines/piper/piper.exe")),
+            default_output_dir=str(
+                resolve_app_path(self.settings.get("output_dir", "output"))
+            ),
+        )
+        self.page_stack.addWidget(self.video_dubbing_page)
         content_layout.addWidget(self.page_stack, 1)
 
         body_layout.addWidget(content_widget, 1)
@@ -987,6 +997,7 @@ class MainWindow(QMainWindow):
             ("nav_music", "Music", self._show_music_page),
             ("nav_review", "Review", self._show_review_page),
             ("audio_mix_preview", "Audio Mix", self._show_mix_preview_page),
+            ("nav_video_dubbing", "Video Dubbing", self._show_video_dubbing_page),
         ):
             action = QAction(self.tr(label_key, default), self)
             action.triggered.connect(callback)
@@ -1092,6 +1103,12 @@ class MainWindow(QMainWindow):
                 "waveform",
                 self.tr("audio_mix_preview", "Audio Mix"),
                 self._show_mix_preview_page,
+            ),
+            (
+                "video_dubbing",
+                "waveform",
+                self.tr("nav_video_dubbing", "Video Dubbing"),
+                self._show_video_dubbing_page,
             ),
         )
         for key, icon_name, text, callback in nav_items:
@@ -2109,9 +2126,26 @@ class MainWindow(QMainWindow):
         self.review_rebuild_button.setIcon(ui_icon("render"))
         self.review_rebuild_button.setIconSize(QSize(18, 18))
         self.review_rebuild_button.clicked.connect(self._start_review_rebuild)
+        self.review_goto_dubbing_button = QPushButton(
+            self.tr("review_goto_dubbing", "Go to Video Dubbing")
+        )
+        self.review_goto_dubbing_button.setIcon(ui_icon("regenerate"))
+        self.review_goto_dubbing_button.setIconSize(QSize(18, 18))
+        self.review_goto_dubbing_button.setToolTip(
+            self.tr(
+                "review_goto_dubbing_tip",
+                "Switch to the Video Dubbing page and select the cues that "
+                "failed transcript validation so you can regenerate them.",
+            )
+        )
+        self.review_goto_dubbing_button.clicked.connect(
+            self._goto_video_dubbing_for_failed
+        )
+        self.review_goto_dubbing_button.setVisible(False)
         header.addWidget(self.review_refresh_button)
         header.addWidget(self.review_verify_button)
         header.addWidget(self.review_rebuild_button)
+        header.addWidget(self.review_goto_dubbing_button)
         card_layout.addLayout(header)
 
         self.review_table = QTableWidget(0, 8)
@@ -2626,6 +2660,104 @@ class MainWindow(QMainWindow):
             "voice",
         )
         self._refresh_voices_page()
+
+    def _show_video_dubbing_page(self) -> None:
+        ffmpeg_path = str(self.settings.get("ffmpeg_path", "ffmpeg/ffmpeg.exe"))
+        output_dir = str(resolve_app_path(self.settings.get("output_dir", "output")))
+        self.video_dubbing_page.set_ffmpeg_path(ffmpeg_path)
+        self.video_dubbing_page.project_dir_picker.set_path(output_dir)
+        # Inject the engine runtime only. Do not force the main-window gallery
+        # voice over an already chosen project/page voice (that caused male
+        # references to stick after selecting Russian Woman on the dubbing page).
+        try:
+            voice_config = self._current_voice_config()
+        except Exception:
+            voice_config = None
+        if voice_config is not None:
+            try:
+                engine_id = str(voice_config.get("engine", "piper"))
+                # Prefer the engine already selected on the dubbing page/project.
+                page_engine = ""
+                try:
+                    page_engine = str(
+                        self.video_dubbing_page.tts_engine_combo.currentData() or ""
+                    )
+                except Exception:
+                    page_engine = ""
+                if page_engine:
+                    engine_id = page_engine
+                piper_path = resolve_app_path(
+                    self.settings.get("piper_path", "engines/piper/piper.exe")
+                )
+                from app.tts.engine_registry import create_tts_engine
+
+                engine = create_tts_engine(engine_id, piper_path)
+                self.video_dubbing_page.set_engine_context(
+                    engine, voice_config, ffmpeg_path
+                )
+            except Exception as exc:
+                self.log_view.append_event(f"Video dubbing engine init skipped: {exc}")
+        try:
+            self.video_dubbing_page.openReviewRequested.disconnect()
+        except Exception:
+            pass
+        self.video_dubbing_page.openReviewRequested.connect(self.open_review_for_dubbing)
+        self._show_page(
+            6,
+            "video_dubbing",
+            self.tr("nav_video_dubbing", "Video Dubbing"),
+            self.tr(
+                "video_dubbing_subtitle",
+                "Dub a video from an SRT script with timed TTS narration.",
+            ),
+            "waveform",
+        )
+
+    def open_review_for_dubbing(self, project) -> None:
+        """Open Generation Review filled from a Video Dubbing project cues."""
+        from app.core.audiobook_store import StoredSegment
+
+        self._review_mode = "dubbing"
+        self._dubbing_review_project = project
+        segments: list[StoredSegment] = []
+        for cue in getattr(project, "cues", []) or []:
+            if not getattr(cue, "enabled", True):
+                continue
+            wav = None
+            for candidate in (cue.fitted_audio_path, cue.raw_audio_path):
+                if candidate and Path(candidate).is_file():
+                    wav = Path(candidate)
+                    break
+            if wav is None:
+                continue
+            segments.append(
+                StoredSegment(
+                    id=-(int(cue.sequence) + 1),
+                    audiobook_id=-1,
+                    sequence_index=int(cue.sequence),
+                    chapter_index=0,
+                    chapter_title=f"Cue {cue.sequence}",
+                    source_text=str(cue.spoken_text or cue.source_text or ""),
+                    wav_path=str(wav),
+                    status="rendered",
+                    similarity_score=None,
+                    verification_status="not_verified",
+                    transcript_text="",
+                    voice=str(getattr(project.settings, "voice", "") or ""),
+                    language=str(getattr(project.settings, "language", "") or ""),
+                    duration_ms=int(cue.fitted_duration_ms or cue.raw_duration_ms or 0),
+                )
+            )
+        self._dubbing_review_segments = segments
+        self._show_review_page()
+        self.log_view.append_event(
+            self.tr(
+                "review_dubbing_loaded",
+                "Dubbing review loaded: {count} cue(s). "
+                "Press «Verify pending» to run Faster Whisper transcription.",
+                count=len(segments),
+            )
+        )
 
     def _show_review_page(self) -> None:
         self._show_page(
@@ -12211,7 +12343,6 @@ class MainWindow(QMainWindow):
             self._refresh_review_page()
 
     def _refresh_review_page(self) -> None:
-        audiobook = self._current_audiobook()
         previous_selection = self.selected_review_segment_id
         current_selection = self._selected_review_segment() if hasattr(self, "review_table") else None
         if current_selection is not None:
@@ -12219,6 +12350,154 @@ class MainWindow(QMainWindow):
         self.review_segments = []
         self.review_table.blockSignals(True)
         self.review_table.setRowCount(0)
+
+        # Optional Video Dubbing review session (cue WAVs + spoken text).
+        if getattr(self, "_review_mode", "") == "dubbing" and getattr(
+            self, "_dubbing_review_segments", None
+        ):
+            project = getattr(self, "_dubbing_review_project", None)
+            segments = list(self._dubbing_review_segments)
+            title = getattr(project, "title", None) or "Video Dubbing"
+            self.review_subtitle_label.setText(
+                self.tr(
+                    "review_current_dubbing",
+                    "Video dubbing: {title} ({count} cue(s) with audio).",
+                    title=title,
+                    count=len(segments),
+                )
+            )
+            filtered_segments = [
+                segment for segment in segments if self._review_filter_matches(segment)
+            ]
+            self.review_segments = filtered_segments
+            pending_count = sum(
+                1
+                for segment in filtered_segments
+                if Path(segment.wav_path).is_file()
+                and (
+                    segment.similarity_score is None
+                    or segment.verification_status
+                    in {"", "pending", "not_verified"}
+                )
+            )
+            whisper_ok = self.faster_whisper_manager.is_installed()
+            self.review_verify_button.setEnabled(
+                pending_count > 0
+                and whisper_ok
+                and self.verification_thread is None
+            )
+            if not whisper_ok:
+                self.review_verify_button.setText(
+                    self.tr(
+                        "review_install_whisper_first",
+                        "Install Faster Whisper (Settings)",
+                    )
+                )
+                self.review_verify_button.setToolTip(
+                    self.tr(
+                        "review_whisper_required_tip",
+                        "Install Faster Whisper small in Settings → Review, "
+                        "then press this button to transcribe dubbing cues.",
+                    )
+                )
+            elif pending_count:
+                self.review_verify_button.setText(
+                    self.tr(
+                        "verify_pending_segments",
+                        "Verify pending ({count})",
+                        count=pending_count,
+                    )
+                )
+                self.review_verify_button.setToolTip(
+                    self.tr(
+                        "review_dubbing_verify_tip",
+                        "Run Faster Whisper on pending cue WAVs and compare "
+                        "transcript to spoken text (similarity %).",
+                    )
+                )
+            else:
+                self.review_verify_button.setText(
+                    self.tr(
+                        "verify_pending_segments_none",
+                        "No pending verification",
+                    )
+                )
+            self.review_rebuild_button.setEnabled(False)
+            self.review_rebuild_button.setToolTip(
+                self.tr(
+                    "review_rebuild_disabled_dubbing",
+                    "Rebuild audiobook is disabled for video dubbing. "
+                    "Use the Video Dubbing page (Generate / Refit / Mix).",
+                )
+            )
+            failed_sequences = [
+                segment.sequence_index
+                for segment in filtered_segments
+                if segment.verification_status == "retry_needed"
+            ]
+            failed_count = len(failed_sequences)
+            self._dubbing_failed_sequences = failed_sequences
+            if failed_count:
+                self.review_goto_dubbing_button.setVisible(True)
+                self.review_goto_dubbing_button.setEnabled(True)
+                self.review_goto_dubbing_button.setText(
+                    self.tr(
+                        "review_goto_dubbing_failed",
+                        "Fix {count} in Video Dubbing",
+                        count=failed_count,
+                    )
+                )
+            else:
+                self.review_goto_dubbing_button.setVisible(False)
+            self.review_table.setRowCount(len(filtered_segments))
+            selected_row = -1
+            for row_index, segment in enumerate(filtered_segments):
+                if previous_selection == segment.id:
+                    selected_row = row_index
+                score = (
+                    ""
+                    if segment.similarity_score is None
+                    else f"{segment.similarity_score:.1f}%"
+                )
+                values = [
+                    str(segment.sequence_index),
+                    segment.chapter_title,
+                    self._segment_review_state(segment),
+                    score,
+                    "",
+                    self._short_table_text(segment.source_text),
+                    self._short_table_text(segment.transcript_text),
+                ]
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setData(Qt.ItemDataRole.UserRole, segment.id)
+                    self.review_table.setItem(row_index, column, item)
+                action_widget = QWidget()
+                action_layout = QHBoxLayout(action_widget)
+                action_layout.setContentsMargins(0, 0, 0, 0)
+                play_button = QPushButton()
+                play_button.setIcon(ui_icon("play"))
+                play_button.setFixedWidth(34)
+                play_button.setEnabled(Path(segment.wav_path).is_file())
+                play_button.clicked.connect(
+                    lambda _c=False, path=segment.wav_path: self._play_review_audio(path)
+                )
+                action_layout.addWidget(play_button)
+                self.review_table.setCellWidget(row_index, 7, action_widget)
+            self.review_table.blockSignals(False)
+            if selected_row >= 0:
+                self.review_table.selectRow(selected_row)
+            self.review_status_label.setText(
+                self.tr(
+                    "review_dubbing_status",
+                    "Dubbing review: play cue audio and optional Whisper check. "
+                    "Regenerate from the Video Dubbing page.",
+                )
+            )
+            return
+
+        self._review_mode = "audiobook"
+        audiobook = self._current_audiobook()
         if audiobook is None:
             self.review_table.blockSignals(False)
             self.selected_review_segment_id = None
@@ -12288,6 +12567,9 @@ class MainWindow(QMainWindow):
                 "Rebuild the audiobook from current segment audio files.",
             )
         )
+        # Navigation to Video Dubbing is only relevant in dubbing review mode.
+        self.review_goto_dubbing_button.setVisible(False)
+        self._dubbing_failed_sequences = []
         self.review_table.setRowCount(len(filtered_segments))
         selected_row = -1
         for row_index, segment in enumerate(filtered_segments):
@@ -13432,10 +13714,126 @@ class MainWindow(QMainWindow):
         self._refresh_whisper_status()
 
     def _start_latest_verification(self) -> None:
+        if getattr(self, "_review_mode", "") == "dubbing":
+            self._start_dubbing_verification()
+            return
         self._start_verification_for_latest(show_review=True)
+
+    def _start_dubbing_verification(self) -> None:
+        """Transcribe video-dubbing cue WAVs with Faster Whisper (no audiobook DB)."""
+        if self.verification_thread is not None:
+            return
+        segments = list(getattr(self, "_dubbing_review_segments", []) or [])
+        if not segments:
+            self.log_view.append_event(
+                self.tr(
+                    "review_no_dubbing_segments",
+                    "No dubbing cues loaded. Open review from Video Dubbing → More.",
+                )
+            )
+            return
+        if not self.faster_whisper_manager.is_installed():
+            self.log_view.append_event(
+                self.tr(
+                    "review_whisper_not_installed",
+                    "Faster Whisper is not installed. "
+                    "Settings → Review → install Faster Whisper small.",
+                )
+            )
+            return
+        from app.workers.verification_worker import DubbingListVerificationWorker
+
+        self.review_progress_bar.setVisible(True)
+        self.review_progress_bar.setRange(0, 100)
+        self.review_progress_bar.setValue(0)
+        self.review_verify_button.setEnabled(False)
+        # Prefer project language when set to auto in UI.
+        language = str(self.review_language_combo.currentData() or "auto")
+        project = getattr(self, "_dubbing_review_project", None)
+        if language in {"", "auto"} and project is not None:
+            language = str(getattr(project.settings, "language", "") or "auto") or "auto"
+        worker = DubbingListVerificationWorker(
+            segments,
+            self.preloaded_whisper_verifier,
+            str(self.review_device_combo.currentData() or "cpu"),
+            str(self.review_compute_combo.currentData() or "int8"),
+            language,
+            self.review_beam_spin.value(),
+            self.review_threshold_spin.value(),
+            only_unverified=True,
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_review_progress)
+        worker.log.connect(self.log_view.append_event)
+        worker.segment_updated.connect(self._on_dubbing_segment_verified)
+        worker.finished.connect(self._on_review_finished)
+        worker.failed.connect(self._on_review_failed)
+        worker.cancelled.connect(self._on_review_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_verification_worker)
+        self.verification_worker = worker
+        self.verification_thread = thread
+        self.log_view.append_event(
+            self.tr(
+                "review_dubbing_started",
+                "Whisper transcription started for video dubbing cues...",
+            )
+        )
+        thread.start()
+
+    def _on_dubbing_segment_verified(self, segment) -> None:
+        segments = getattr(self, "_dubbing_review_segments", None)
+        if not segments:
+            return
+        for index, item in enumerate(segments):
+            if item.id == segment.id:
+                segments[index] = segment
+                break
+        # Lightweight table refresh without losing mode.
+        self._refresh_review_page()
+
+    def _goto_video_dubbing_for_failed(self) -> None:
+        """Switch to Video Dubbing and select cues that failed validation.
+
+        Only used in dubbing review mode; the audiobook flow keeps its own
+        rebuild/regenerate algorithm.
+        """
+        sequences = list(getattr(self, "_dubbing_failed_sequences", []) or [])
+        project = getattr(self, "_dubbing_review_project", None)
+        if project is None or not sequences:
+            return
+        self._show_video_dubbing_page()
+        page = self.video_dubbing_page
+        # Reload the project on the dubbing page if it differs from the one
+        # under review (e.g. user opened another project meanwhile).
+        current = getattr(page, "_project", None)
+        if current is None or getattr(current, "project_id", None) != getattr(
+            project, "project_id", None
+        ):
+            manifest = project.project_dir / "dubbing_project.json"
+            if manifest.is_file():
+                page._load_project_from_manifest(manifest)
+        page.select_cues_by_sequence(sequences)
+        self.log_view.append_event(
+            self.tr(
+                "review_dubbing_goto_selected",
+                "Switched to Video Dubbing: {count} cue(s) selected for "
+                "regeneration. Use «Generate Selected» to re-synthesize.",
+                count=len(sequences),
+            )
+        )
 
     def _start_verification_for_latest(self, show_review: bool = False) -> None:
         if self.verification_thread is not None:
+            return
+        if getattr(self, "_review_mode", "") == "dubbing":
+            self._start_dubbing_verification()
             return
         audiobook = self._current_audiobook()
         if audiobook is None:
@@ -14102,6 +14500,39 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        # Video dubbing runs on its own QThread. Block the close until that
+        # thread has actually stopped so we never hit
+        # "QThread: Destroyed while thread is still running".
+        if self.video_dubbing_page is not None:
+            thread = getattr(self.video_dubbing_page, "_worker_thread", None)
+            if thread is not None and thread.isRunning():
+                choice = QMessageBox.question(
+                    self,
+                    self.tr("video_dubbing_running_title", "Video dubbing is running"),
+                    self.tr(
+                        "video_dubbing_running_close_msg",
+                        "A dubbing operation is still running. Cancel it and "
+                        "close the application?",
+                    ),
+                )
+                if choice != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+                if not self.video_dubbing_page.shutdown(10_000):
+                    QMessageBox.warning(
+                        self,
+                        self.tr("still_stopping", "Still stopping"),
+                        self.tr(
+                            "video_dubbing_still_stopping_msg",
+                            "The dubbing worker is still stopping. Please wait a "
+                            "moment and close the application again.",
+                        ),
+                    )
+                    event.ignore()
+                    return
+            else:
+                # Ensure media + best-effort cancel even when not running.
+                self.video_dubbing_page.cleanup()
         if not self._confirm_project_switch():
             event.ignore()
             return

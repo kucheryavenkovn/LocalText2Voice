@@ -342,17 +342,51 @@ def main() -> int:
             mode = str(request.get("mode", "clone") or "clone").lower()
             generation_kwargs = {"text": text}
             language = str(request.get("language", "") or "").strip()
+            # OmniVoice prefers full names; short codes still work but clone
+            # quality is better with explicit language.
+            lang_map = {
+                "ru": "Russian",
+                "en": "English",
+                "es": "Spanish",
+                "fr": "French",
+                "de": "German",
+                "zh": "Chinese",
+                "ja": "Japanese",
+                "ko": "Korean",
+                "pt": "Portuguese",
+                "it": "Italian",
+            }
             if language and language.lower() not in {"auto", "default"}:
-                generation_kwargs["language"] = language
+                generation_kwargs["language"] = lang_map.get(language.lower(), language)
 
             if mode == "clone":
                 ref_audio = str(request.get("ref_audio", "")).strip()
                 if not ref_audio:
                     raise ValueError("Voice cloning mode requires a reference audio file.")
-                generation_kwargs["ref_audio"] = ref_audio
-                ref_text = str(request.get("ref_text", "")).strip()
-                if ref_text:
-                    generation_kwargs["ref_text"] = ref_text
+                ref_path = Path(ref_audio)
+                if not ref_path.is_file():
+                    raise ValueError(f"Reference audio not found: {ref_audio}")
+                ref_text = str(request.get("ref_text", "")).strip() or None
+                # Build a reusable clone prompt once per reference file so the
+                # speaker embedding is applied consistently (and logged).
+                cache = globals().setdefault("_voice_clone_prompt_cache", {})
+                cache_key = (str(ref_path.resolve()), ref_text or "")
+                prompt = cache.get(cache_key)
+                if prompt is None:
+                    prompt_kwargs = {"ref_audio": str(ref_path.resolve())}
+                    if ref_text:
+                        prompt_kwargs["ref_text"] = ref_text
+                    prompt = model.create_voice_clone_prompt(**prompt_kwargs)
+                    cache[cache_key] = prompt
+                    emit_info(
+                        f"Voice clone prompt ready: {ref_path.name} "
+                        f"({ref_path.parent.name})"
+                    )
+                generation_kwargs["voice_clone_prompt"] = prompt
+                emit_info(
+                    f"Clone synth using ref={ref_path.name} "
+                    f"dir={ref_path.parent.name} lang={generation_kwargs.get('language', 'auto')}"
+                )
             elif mode == "design":
                 instruct = str(request.get("instruct", "")).strip()
                 if instruct:
@@ -364,6 +398,9 @@ def main() -> int:
                 value = request.get(key)
                 if value is not None and value != "":
                     generation_kwargs[key] = value
+            # Prefer higher quality steps for clone when not overridden.
+            if mode == "clone" and "num_step" not in generation_kwargs:
+                generation_kwargs["num_step"] = 32
 
             synth_started = time.perf_counter()
             audio = model.generate(**generation_kwargs)

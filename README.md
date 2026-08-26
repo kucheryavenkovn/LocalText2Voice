@@ -82,6 +82,59 @@ flowchart TD
     J --> K["11. Export<br>Clean MP3, podcast mix, subtitles, project data"]
 ```
 
+## Video Dubbing (Озвучка видео)
+
+Timed TTS dubbing from an SRT script. The video picture is never re-timed (not lip-sync). Each cue is synthesized, fitted into its time window, placed on the absolute timeline, mixed with original audio (optional ducking), and muxed to MP4/MKV.
+
+See also the technical notes in [`docs/VIDEO_DUBBING.md`](docs/VIDEO_DUBBING.md).
+
+### Timing modes
+
+| Control | Options | Meaning |
+| --- | --- | --- |
+| **Timing mode** | Strict intervals / Elastic groups | Strict = each cue stays in its own SRT `start–end`. Elastic = may borrow free time to the right and shift later cues **right only**, with a shared speed factor inside a small group. Source SRT is not rewritten (`planned_*` times are stored separately). |
+| **Sync mode** | Strict / Best effort | How hard a **single** cue is forced into its window when fitting (overflow policy), not the same as elastic groups. |
+| **Tempo smoothing** | Off / Smooth neighbors / Common group factor | Separate from elastic. Reduces harsh speed jumps between neighbors. In strict timing it does **not** move timecodes—only planned speed factors. |
+
+**Important:** speeding up (atempo) and elastic shifts run at **refit** time, **after** TTS. Raw voice is generated first at natural length; then **Recalculate** applies speed/placement.
+
+### When to press which button
+
+| You changed… | Press | TTS again? |
+| --- | --- | --- |
+| Voice / engine / spoken text | **Create speech** (or Force all / Selected) | **Yes** |
+| Preferred/hard speed, pause compress, elastic/tempo settings | **Recalculate** | No |
+| Elastic group / right shift only | **Recalculate** then **Narration track** | No |
+| Ducking / volumes only | **Mix** | No |
+| After speech or refit | **Narration** → **Mix** → **Video** | No |
+
+Typical order after a full voice change:
+
+1. Select voice (e.g. Russian Woman) → **Create speech** / **Force all**  
+2. Set Timing (elastic/tempo if needed) → **Recalculate**  
+3. **Narration** → **Mix** / **Preview** → **Video**  
+4. Optional: **More → Cue review (Whisper)** to listen and verify cue WAVs  
+
+Orange **⚠** badges on action buttons mean that step is still required (stale or missing artifacts). The status line under the player summarizes the next steps.
+
+### Timeline color legend
+
+| Color | Meaning |
+| --- | --- |
+| **Green** | Ready (`rendered` / `fitted`), little or no speed-up |
+| **Blue** | Mild speed-up within preferred limit |
+| **Orange** | Strong speed-up (between preferred and hard limit) |
+| **Red / dark red** | Problem: failed, needs shortening, or overflow |
+| **Yellow outline** | Selected cue |
+| **Cyan dashed box** | Elastic or tempo **group** (and/or right shift) |
+| **Dim gray underlay** | Original SRT interval under the planned block |
+
+Hover a block for SRT vs planned times, speed, shift (ms), and group id. Click = select/seek; double-click = play.
+
+### Generation review for dubbing
+
+**More → Cue review (Whisper)** opens the shared Review page filled from the current dubbing project’s cue audio (fitted preferred, else raw) and spoken text. Play and optional Whisper checks work; **Rebuild audiobook** stays disabled—regenerate from the Video Dubbing page.
+
 ## Main Features
 
 ### AI Text-To-Speech Engines
